@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- 从这里开始是新增的：前端入口页。项目里 frontend/ 下原本只有 src/main.jsx，
+     没有这个挂载点，浏览器打开后 createRoot(document.getElementById('root')) 会拿到 null。 -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>码上面试</title>
+  </head>
+  <body>
+    <!-- React 的挂载点，id 必须与 src/main.jsx 末尾的 getElementById('root') 一致。 -->
+    <div id="root"></div>
+    <!-- type="module" 是 Vite 的要求：main.jsx 里用的是 import 语法。 -->
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+<!-- 新增结束 -->

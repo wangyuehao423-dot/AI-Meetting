@@ -1,0 +1,110 @@
+# 从这里开始是新增的：显式声明后端端口，默认 18080。
+# 为什么不用 Spring Boot 默认的 8080：Windows 上 Hyper-V / WSL2 / Docker Desktop 会在开机时
+# 动态保留若干 TCP 端口段（可用 netsh int ipv4 show excludedportrange protocol=tcp 查看），
+# 落在保留段里的端口即使没有任何进程监听，绑定也会直接失败并报
+# "Web server failed to start. Port 8080 was already in use."。
+# 本机 8080 恰好落在一个保留段（7986-8085）里，所以改用区间外的 18080。
+# 这些保留段每次开机/容器重启都可能变化，因此端口做成可通过环境变量覆盖：
+# 想换回 8080 时，起个 INTERVIEW_SERVER_PORT=8080 即可（前提是那时 8080 已不在保留段内）。
+# 注意：改这里必须同步改 frontend/vite.config.js 里 /api 与 /ws 两个代理的 target。
+server:
+  port: ${INTERVIEW_SERVER_PORT:18080}
+
+spring:
+  ai:
+    openai:
+      base-url: ${INTERVIEW_AI_BASE_URL:https://tokenx24.com/v1}
+      api-key: ${INTERVIEW_AI_API_KEY:change-me}
+      # 注意：不要在这里配 http-client 超时——Spring AI 1.0.0-M6 的
+      # OpenAiParentProperties 没有 httpClient 字段，配了也不会被绑定（实测无效，
+      # AI 调用曾因此永久卡在 SSL 读取上 400+ 秒）。超时由
+      # AiHttpClientConfig 里注册的 RestClient.Builder bean 统一提供，
+      # connect 10s / write 30s / read 180s，OpenAiAutoConfiguration 会自动采用。
+      chat:
+        # 从这里开始是新增的：把 AI 请求路径显式改成 /chat/completions。
+        # 为什么必须写这一行：Spring AI 1.0.0-M6 里 OpenAiApi 的默认路径是 "/v1/chat/completions"
+        # （base-url 默认 https://api.openai.com）。而本项目的 base-url 已经带了 "/v1"
+        # （https://tokenx24.com/v1），Spring AI 会把两者直接拼接，实际请求发到
+        # https://tokenx24.com/v1/v1/chat/completions，多了一层 /v1，服务端返回
+        # 404 page not found。表现就是上传简历时 NonTransientAiException: 404，
+        # 因为上传流程里 ResumeAiExtractionService 会调 AI 提取技能。
+        # 覆盖成 /chat/completions 后，拼出来正好是 https://tokenx24.com/v1/chat/completions。
+        completions-path: /chat/completions
+        # 新增结束
+        options:
+          # 从这里开始是修改的：默认模型从 gpt-5.5 换成 deepseek-v4.1-flash。
+          # 为什么必须换：项目按文档配置的 gpt-5.5 在本 AI 中转站上被上游
+          # 长期限流（持续返回 429 Upstream rate limit exceeded，等了 3 分钟+
+          # 仍未恢复），而同 key 下 glm-5.3-flash / deepseek-v4.1-flash /
+          # qwen3.8-flash / kimi-k2.7 / MiniMax-M3 均正常返回 200。
+          # 全链路（出题/评分/追问/报告/简历技能提取）用的都是这一个模型配置，
+          # 不换模型整条链路就永远跑不通。业务语义不依赖具体模型名，
+          # 且可通过环境变量 INTERVIEW_AI_MODEL 覆盖，随时可切回 gpt-5.5。
+          model: ${INTERVIEW_AI_MODEL:deepseek-v4.1-flash}
+  datasource:
+    # 从这里开始是修改的：JDBC URL 显式指定 UTF-8 字符集。
+    # 为什么必须加：MySQL 8 的 Connector/J 在 URL 未指定 characterEncoding 时，
+    # 会话字符集可能落到 latin1（实测 character_set_client/results = latin1），
+    # 数据库里正常的 UTF-8 中文被按 Latin-1 解码成乱码 String，岗位名、简历技能
+    # 等所有中文数据经 JSON 输出后前端全部显示乱码（如 "Java åŽç«¯å·¥ç¨‹å¸ˆ"）。
+    # useUnicode=true + characterEncoding=UTF-8 强制 Connector/J 用 utf8mb4 会话；
+    # connectionCollation 显式钉住排序规则，避免服务器端默认值差异再次翻转。
+    url: ${INTERVIEW_DB_URL:jdbc:mysql://localhost:15006/interview?useUnicode=true&characterEncoding=UTF-8&connectionCollation=utf8mb4_general_ci}
+    username: ${INTERVIEW_DB_USERNAME:root}
+    password: ${INTERVIEW_DB_PASSWORD:root}
+
+  data:
+    redis:
+      host: ${INTERVIEW_REDIS_HOST:localhost}
+      port: ${INTERVIEW_REDIS_PORT:16379}
+    mongodb:
+      uri: ${INTERVIEW_MONGO_URI:mongodb://localhost:27017/interview}
+
+  # 从这里开始是新增的：本地关闭 Nacos，让应用不依赖注册中心/配置中心也能启动。
+  # 背景：pom.xml 里引入了 nacos-config 和 nacos-discovery 两个 starter，
+  # 只要它们在 classpath 上，Spring Cloud 就会做两件事：
+  #   1) 强制要求配置里写 spring.config.import=nacos:，否则直接 APPLICATION FAILED TO START；
+  #   2) 默认尝试把服务注册到 localhost:8848 的 Nacos，本地没起 Nacos 时会连接失败。
+  # 但当前工程代码里并没有真正使用 Nacos（没有 @EnableDiscoveryClient、没有注入 DiscoveryClient、
+  # 也没有从配置中心拉配置），所以本地开发直接关掉即可，启动更快也不需要额外装 Nacos。
+  # 以后真要用 Nacos，把下面两个 enabled 改成 true，并补上 spring.config.import 即可。
+  cloud:
+    nacos:
+      config:
+        enabled: false
+        # import-check=false：关掉“必须声明 spring.config.import”这项启动校验
+        import-check:
+          enabled: false
+      discovery:
+        # enabled=false：不再尝试注册到 Nacos 服务端
+        enabled: false
+  # 新增结束
+
+interview:
+  jwt-secret: ${INTERVIEW_JWT_SECRET:change-me}
+  singleflight:
+    local-fallback-enabled: ${INTERVIEW_SINGLEFLIGHT_LOCAL_FALLBACK_ENABLED:true}
+  ai:
+    base-url: ${INTERVIEW_AI_BASE_URL:https://tokenx24.com/v1}
+    api-key: ${INTERVIEW_AI_API_KEY:change-me}
+    # 与 spring.ai.openai.chat.options.model 保持一致，防止两处模型配置不一致
+    model: ${INTERVIEW_AI_MODEL:deepseek-v4.1-flash}
+
+aliyun:
+  nls:
+    # 对应 @Value("${aliyun.nls.app-key}")；冒号后留空 = 没配就用空字符串，
+    # 这样本地没设环境变量时应用仍能启动，不会因为占位符解析不到直接报错。
+    app-key: ${ALIYUN_NLS_APP_KEY:change-me}
+    # 阿里云 AccessKey ID：只在后端签发临时 Token 时用到，不下发到浏览器。
+    access-key-id: ${ALIYUN_NLS_ACCESS_KEY_ID:change-me}
+    # 阿里云 AccessKey Secret：用于后端签发临时 Token。
+    access-key-secret: ${ALIYUN_NLS_ACCESS_KEY_SECRET:change-me}
+
+# 从这里开始是新增的：LiteFlow 规则文件位置。
+# 规则文件放在 src/main/resources/flow/interview.xml，打包后就在 classpath 的 flow/ 目录下，
+# 所以这里用目录通配符把整个 flow/ 扫进来，以后往 flow/ 下加链不用再改本配置。
+# 不配这一段，LiteFlow 只会去自己的默认位置找规则，结果就是"一条链都没加载"，
+# XML 写得再对也白搭（追问链会直接抛 chain not found）。
+liteflow:
+  rule-source: flow/*.xml
+# 新增结束

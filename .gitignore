@@ -1,0 +1,24 @@
+# Build outputs
+target/
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data & local state
+data/
+*.log
+server-run*.log
+.env
+*.pem
+
+# Local IDE / OS files
+.idea/
+.vscode/
+.fltest/
+
+# Local-only launchers & dev helpers (contain absolute local paths or test scaffolding)
+backend-launcher.bat
+frontend-launcher.bat
+*.ps1
+AI-Meetting-原始副本.md
+q-a.sql
+resume-test.pdf

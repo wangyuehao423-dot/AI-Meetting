@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<flow>
+    <!--
+      <flow> 是根节点：<nodes> 声明节点、<chain> 声明链。追问链共 5 个节点组成三条链，
+      每条 3 节点串行，按"公共节点 + 分数段节点"复用：loadQuestionContext / persistFollowUp
+      三条链共用，generateBasic/Normal/DeepFollowUp 各链唯一。THEN 表示串行，前一个节点写进
+      共享上下文、后一个节点能读到。class 必须写嵌套类二进制名，否则反射找不到类。
+    -->
+    <nodes>
+        <!-- 公共节点：从题目表和答案表加载原题与作答，供后续任一生成节点使用 -->
+        <node id="loadQuestionContext"
+              class="com.example.interview.ai.FollowUpLiteFlowNodes$LoadQuestionContext"/>
+        <!-- 基础追问节点：分数 < 60 时执行 -->
+        <node id="generateBasicFollowUp"
+              class="com.example.interview.ai.FollowUpLiteFlowNodes$GenerateBasicFollowUp"/>
+        <!-- 常规追问节点：60 <= 分数 < 80 时执行 -->
+        <node id="generateNormalFollowUp"
+              class="com.example.interview.ai.FollowUpLiteFlowNodes$GenerateNormalFollowUp"/>
+        <!-- 深度追问节点：分数 >= 80 时执行 -->
+        <node id="generateDeepFollowUp"
+              class="com.example.interview.ai.FollowUpLiteFlowNodes$GenerateDeepFollowUp"/>
+        <!-- 公共节点：把生成的追问幂等落库，三条链共用 -->
+        <node id="persistFollowUp"
+              class="com.example.interview.ai.FollowUpLiteFlowNodes$PersistFollowUp"/>
+    </nodes>
+    <chain name="followUpBasicChain">
+        THEN(loadQuestionContext, generateBasicFollowUp, persistFollowUp)
+    </chain>
+    <chain name="followUpNormalChain">
+        THEN(loadQuestionContext, generateNormalFollowUp, persistFollowUp)
+    </chain>
+    <chain name="followUpDeepChain">
+        THEN(loadQuestionContext, generateDeepFollowUp, persistFollowUp)
+    </chain>
+</flow>
