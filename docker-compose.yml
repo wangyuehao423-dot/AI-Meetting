@@ -1,3 +1,7 @@
+# 固定 compose 项目名：不写这一行时，项目名由目录名推导（"AI Meetting1" → aimeetting1），
+# 换了机器或重命名目录就会另起一套容器，和已有的 aimeetting-* 抢端口。
+name: aimeetting
+
 services:
   mysql:
     image: mysql:8.0
@@ -10,10 +14,35 @@ services:
       - mysql-data:/var/lib/mysql
       - ./docker/mysql/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
 
+  # Redis 现在的职责收缩为两件：题级分布式锁（Redisson）、按会话的缓存/单飞状态。
+  # 评分队列已经搬到 RabbitMQ，所以这里不再有三态队列（QUEUE/PROCESSING/DEAD）的 key。
   redis:
     image: redis:7
     ports:
       - "16379:6379"
+
+  # 消息队列：评分任务与报告生成的统一异步通道。
+  # 为什么评分要用 MQ 而不是 Redis 三态队列：
+  #   评分任务的失败处理（ack / 重试 / 死信 / 消费组 / 持久化）是消息队列的标准诉求，
+  #   RabbitMQ 全套原生支持；手写 Redis 队列等于把这些全部重写一遍、还每一件写得更差。
+  # 端口用默认 5672/15672：AI 面试官这套 compose 独占标准端口，
+  # RAG Agent 那套错开到 5673/15673，两套可以同时跑。
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: aimeetting-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: interview
+      RABBITMQ_DEFAULT_PASS: interview123
+    ports:
+      - "5672:5672"      # AMQP 协议端口
+      - "15672:15672"    # 管理台 http://localhost:15672
+    volumes:
+      - mq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   mongodb:
     image: mongo:7
@@ -22,6 +51,26 @@ services:
     volumes:
       - mongo-data:/data/db
 
+  # 配置中心：托管 5 份提示词规则（出题 / 评分 / 追问 / 报告 / 匹配）。
+  # 端口说明：宿主 18848 映射容器 8848 后，Nacos 客户端会自动用「主端口 + 1000」连 gRPC，
+  # 也就是 19848，所以 9848 必须一起映射，否则客户端会一直报连接失败。
+  # 数据必须挂 volume：规则在线上被改过多轮之后，那份内容只存在 Nacos 里，
+  # 仓库里的 md 只是出厂版本。容器一重建就丢，等于把线上调好的提示词全冲掉。
+  nacos:
+    image: nacos/nacos-server:v2.4.2
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "false"
+      JVM_XMS: 512m
+      JVM_XMX: 512m
+    ports:
+      - "18848:8848"
+      - "19848:9848"
+    volumes:
+      - nacos-data:/home/nacos/data
+
 volumes:
   mysql-data:
   mongo-data:
+  nacos-data:
+  mq-data:

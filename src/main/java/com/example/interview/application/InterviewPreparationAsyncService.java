@@ -40,10 +40,6 @@ public class InterviewPreparationAsyncService {
     // **统一 AI 出题入口，避免首题继续使用固定字符串占位。**
     private final InterviewAiFacade ai;
     private final QuestionMapper questions;
-    // 从这里开始是新增的：心跳服务。为什么注入到这里：prepare 是准备任务的唯一入口，
-    // 只有它知道任务开始与结束的时刻，register / unregister 才能严格配对。
-    private final HeartbeatService heartbeat;
-    // 新增结束
 
     public InterviewPreparationAsyncService(
             InterviewSessionMapper sessionMapper,
@@ -53,11 +49,7 @@ public class InterviewPreparationAsyncService {
             InterviewSessionStateMachine machine,
             NextQuestionPreGeneratorService preGenerator,
             InterviewAiFacade ai,
-            QuestionMapper questions,
-            // 从这里开始是新增的：构造器末尾追加心跳服务依赖（Spring 按类型注入，
-            // 追加在末尾不会打乱既有参数顺序）。
-            HeartbeatService heartbeat
-            // 新增结束
+            QuestionMapper questions
     ) {
         this.sessionMapper = sessionMapper;
         this.resumes = resumes;
@@ -67,9 +59,6 @@ public class InterviewPreparationAsyncService {
         this.preGenerator = preGenerator;
         this.ai = ai;
         this.questions = questions;
-        // 从这里开始是新增的：
-        this.heartbeat = heartbeat;
-        // 新增结束
     }
     /**
      * 推进一步会话状态：加载快照 → 状态机流转 → CAS 写回。
@@ -112,11 +101,6 @@ public class InterviewPreparationAsyncService {
     @Async ("interviewPreparationTaskExecutor")
     public void prepare(UUID sessionId)
     {
-        // 从这里开始是新增的：任务开始，先注册心跳。必须写在 try 外面——
-        // 写在 try 里面的话，前面任何一行抛异常都等于"从来没注册过"，
-        // 而这个任务此刻其实正在跑，补偿器会把"处理中"误判成"线程已死"。
-        heartbeat.register(sessionId);
-        // 新增结束
         try
         {
             InterviewSessionEntity 
@@ -217,12 +201,5 @@ public class InterviewPreparationAsyncService {
                     e
             );
         }
-        // 从这里开始是新增的：任务结束（含异常退出），注销心跳。
-        // 为什么用 finally 而不是接在 catch 后面：catch 只盖住"抛异常"这一条路径，
-        // finally 盖住所有路径；任务线程一旦退出就删掉心跳，不留"看起来还活着"的假信号。
-        finally {
-            heartbeat.unregister(sessionId);
-        }
-        // 新增结束
     }
 }

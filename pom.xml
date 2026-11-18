@@ -45,6 +45,21 @@
     <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-jackson</artifactId><version>0.12.6</version><scope>runtime</scope></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-websocket</artifactId></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
+    <!-- 消息队列：评分任务与报告生成的统一异步通道。
+         为什么评分要从「Redis 三态队列」换成 RabbitMQ：
+         评分任务的失败处理（ack / 重试 / 死信 / 消费组 / 持久化）是消息队列的标准诉求，
+         RabbitMQ 全套原生支持；手写 Redis 队列（LMOVE + 心跳 + 补偿扫库）等于把这些
+         全部重写一遍、还每一件写得更差——这不是取舍，是该用框架却自研了阉割版。 -->
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-amqp</artifactId></dependency>
+    <!-- Redisson：分布式锁（题级锁）。
+         为什么从手写 SET NX EX + UUID 比对删除换过来：
+         锁的三个条件（互斥 / 防死锁 / 防误删）和看门狗自动续期，Redisson 全套做好、久经考验。
+         手写版要自己保证「过期边界」和「只删自己的锁」的正确性，而这些 Redisson 白送。 -->
+    <dependency>
+      <groupId>org.redisson</groupId>
+      <artifactId>redisson</artifactId>
+      <version>3.35.0</version>
+    </dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-mongodb</artifactId></dependency>
     <dependency><groupId>com.alibaba.cloud</groupId><artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId></dependency>
     <dependency><groupId>com.alibaba.cloud</groupId><artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId></dependency>
@@ -76,6 +91,23 @@
               <version>1.18.34</version>
             </path>
           </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+      <!-- Spring Boot 重打包插件：把依赖一起塞进 jar，产出可 java -jar 直接运行的胖包。
+           不声明它时 package 只会打出一个 240KB 的薄包，启动报
+           「jar 中没有主清单属性」——本地开发一直用 mvn spring-boot:run 的话
+           完全发现不了这个问题，直到要部署才踩坑。 -->
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <!-- 只打业务类，不把 lombok 这类编译期依赖带进运行时 -->
+          <excludes>
+            <exclude>
+              <groupId>org.projectlombok</groupId>
+              <artifactId>lombok</artifactId>
+            </exclude>
+          </excludes>
         </configuration>
       </plugin>
     </plugins>

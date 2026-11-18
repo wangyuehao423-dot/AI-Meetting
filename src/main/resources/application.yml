@@ -40,7 +40,12 @@ spring:
           # 全链路（出题/评分/追问/报告/简历技能提取）用的都是这一个模型配置，
           # 不换模型整条链路就永远跑不通。业务语义不依赖具体模型名，
           # 且可通过环境变量 INTERVIEW_AI_MODEL 覆盖，随时可切回 gpt-5.5。
-          model: ${INTERVIEW_AI_MODEL:deepseek-v4.1-flash}
+          # 为什么默认用 glm-5.3-flash：同一中转站上 deepseek-v4.1-flash 会间歇性
+          # 挂满 180 秒读超时（同一时刻 JDK 直连只要 4~9 秒），演示时就是"按钮点下去
+          # 半天不出题"；glm-5.3-flash 实测每次 4.5 秒左右稳定返回。
+          # 全链路（出题/评分/追问/报告/简历技能提取）用的都是这一个模型配置，
+          # 业务语义不依赖具体模型名，可用环境变量 INTERVIEW_AI_MODEL 覆盖切回别的模型。
+          model: ${INTERVIEW_AI_MODEL:glm-5.3-flash}
   datasource:
     # 从这里开始是修改的：JDBC URL 显式指定 UTF-8 字符集。
     # 为什么必须加：MySQL 8 的 Connector/J 在 URL 未指定 characterEncoding 时，
@@ -53,6 +58,32 @@ spring:
     username: ${INTERVIEW_DB_USERNAME:root}
     password: ${INTERVIEW_DB_PASSWORD:root}
 
+  # 消息队列：评分任务与报告生成的统一异步通道。
+  # 为什么端口是 5672：本项目的 compose 独占标准端口，RAG Agent 那套错开到 5673/15673，
+  # 两套服务可以在同一台机器上同时跑。
+  rabbitmq:
+    host: ${INTERVIEW_MQ_HOST:localhost}
+    port: ${INTERVIEW_MQ_PORT:5672}
+    username: ${INTERVIEW_MQ_USER:interview}
+    password: ${INTERVIEW_MQ_PASSWORD:interview123}
+    listener:
+      simple:
+        # manual：ack 由业务代码在「分数落库/报告写回之后」显式调用。
+        # 用 auto（默认）时消息一交给监听方法就算消费成功，消费者随后崩了消息就没了，
+        # 库里的答案会永远停在「待评分」——手动 ack 才是崩溃恢复的前提。
+        acknowledge-mode: manual
+        # prefetch 决定单个消费者手里最多攥几条未确认消息。
+        # 评分单条要调 AI 3~10 秒，预取太多会让一台机器吃满整个队列，多实例分不到活。
+        prefetch: 2
+        concurrency: 2
+        max-concurrency: 4
+    # publisher confirm：把「发布成功」从「方法没抛异常」变成「broker 真的收到了」。
+    # 没有它，发布那一刻 broker 挂了，消息静默丢失，而库里那条答案没人会来救。
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+
   data:
     redis:
       host: ${INTERVIEW_REDIS_HOST:localhost}
@@ -60,45 +91,52 @@ spring:
     mongodb:
       uri: ${INTERVIEW_MONGO_URI:mongodb://localhost:27017/interview}
 
-  # 从这里开始是新增的：本地关闭 Nacos，让应用不依赖注册中心/配置中心也能启动。
-  # 背景：pom.xml 里引入了 nacos-config 和 nacos-discovery 两个 starter，
-  # 只要它们在 classpath 上，Spring Cloud 就会做两件事：
-  #   1) 强制要求配置里写 spring.config.import=nacos:，否则直接 APPLICATION FAILED TO START；
-  #   2) 默认尝试把服务注册到 localhost:8848 的 Nacos，本地没起 Nacos 时会连接失败。
-  # 但当前工程代码里并没有真正使用 Nacos（没有 @EnableDiscoveryClient、没有注入 DiscoveryClient、
-  # 也没有从配置中心拉配置），所以本地开发直接关掉即可，启动更快也不需要额外装 Nacos。
-  # 以后真要用 Nacos，把下面两个 enabled 改成 true，并补上 spring.config.import 即可。
+  # Spring Cloud Alibaba 的 nacos-config / nacos-discovery 两个 starter 仍在 pom 里，
+  # 只要它们在 classpath 上，框架就会强制要求配置里写 spring.config.import=nacos:，否则直接
+  # APPLICATION FAILED TO START。
+  # 但本项目并不需要"把整个 application.yml 搬到配置中心"，只需要把 5 份提示词规则托管到 Nacos，
+  # 所以框架层的自动配置继续保持关闭，改由 SkillConfigClient 用原生 ConfigService 按 dataId 精确拉取
+  # （参数见下方 interview.skill.nacos）。
+  # 这样定位才正确：配置中心是"增强能力"，不是"启动依赖"——Nacos 不在时应用照常起来，
+  # 规则退回 jar 内打包版本，只是线上改配置不再生效。
   cloud:
     nacos:
       config:
         enabled: false
-        # import-check=false：关掉“必须声明 spring.config.import”这项启动校验
+        # import-check=false：关掉"必须声明 spring.config.import"这项启动校验
         import-check:
           enabled: false
       discovery:
-        # enabled=false：不再尝试注册到 Nacos 服务端
+        # enabled=false：不注册到 Nacos 服务端（项目没用到服务发现，开了只会在启动时多一次失败重试）
         enabled: false
   # 新增结束
 
 interview:
   jwt-secret: ${INTERVIEW_JWT_SECRET:change-me}
+  # 从这里开始是新增的：提示词（业务 Skill 规则）的远程托管配置。
+  # 5 份 Markdown 规则放在 Nacos 上，改完在网页上点"发布"即可生效，不需要重新打包发布——
+  # 这是把"改一个标点也要走一次 CI/CD"变成"改完即生效"的关键。
+  # 注意 dataId 的拼法是 <prefix><skill名>.md，必须和 scripts/publish-skills-to-nacos.ps1 保持一致，
+  # 两边对不上会出现"发布了配置但程序一直用打包版本"的静默故障。
+  skill:
+    nacos:
+      # 本地没有 Nacos 时设为 false，程序会直接用 jar 内的 classpath 版本，行为等同改造前。
+      enabled: ${INTERVIEW_SKILL_NACOS_ENABLED:true}
+      # 本机 Docker 把 Nacos 的 8848 映射到了 18848；标准部署环境改回 localhost:8848。
+      server-addr: ${NACOS_SERVER_ADDR:localhost:18848}
+      # 留空 = public 命名空间。生产建议单独开一个 namespace 只放提示词。
+      namespace: ${NACOS_NAMESPACE:}
+      group: ${NACOS_SKILL_GROUP:INTERVIEW_SKILL}
+      data-id-prefix: interview-skill-
+      # 单次拉取超时；启动时 5 份并行拉，所以总耗时约等于这一个值而不是 5 倍。
+      timeout-ms: 3000
   singleflight:
     local-fallback-enabled: ${INTERVIEW_SINGLEFLIGHT_LOCAL_FALLBACK_ENABLED:true}
   ai:
     base-url: ${INTERVIEW_AI_BASE_URL:https://tokenx24.com/v1}
     api-key: ${INTERVIEW_AI_API_KEY:change-me}
     # 与 spring.ai.openai.chat.options.model 保持一致，防止两处模型配置不一致
-    model: ${INTERVIEW_AI_MODEL:deepseek-v4.1-flash}
-
-aliyun:
-  nls:
-    # 对应 @Value("${aliyun.nls.app-key}")；冒号后留空 = 没配就用空字符串，
-    # 这样本地没设环境变量时应用仍能启动，不会因为占位符解析不到直接报错。
-    app-key: ${ALIYUN_NLS_APP_KEY:change-me}
-    # 阿里云 AccessKey ID：只在后端签发临时 Token 时用到，不下发到浏览器。
-    access-key-id: ${ALIYUN_NLS_ACCESS_KEY_ID:change-me}
-    # 阿里云 AccessKey Secret：用于后端签发临时 Token。
-    access-key-secret: ${ALIYUN_NLS_ACCESS_KEY_SECRET:change-me}
+    model: ${INTERVIEW_AI_MODEL:glm-5.3-flash}
 
 # 从这里开始是新增的：LiteFlow 规则文件位置。
 # 规则文件放在 src/main/resources/flow/interview.xml，打包后就在 classpath 的 flow/ 目录下，
@@ -108,3 +146,12 @@ aliyun:
 liteflow:
   rule-source: flow/*.xml
 # 新增结束
+
+# 日志编码：显式钉成 UTF-8。
+# 不配的话 logback 跟随系统默认编码，中文 Windows 下是 GBK——日志里的中文写进文件后
+# 用任何 UTF-8 工具看都是乱码（grep 中文关键字一条都匹配不到），
+# 排查线上问题时等于「有日志但读不了」。
+logging:
+  charset:
+    console: UTF-8
+    file: UTF-8

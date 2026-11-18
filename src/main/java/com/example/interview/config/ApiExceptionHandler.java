@@ -2,6 +2,9 @@
 // 报告接口抛出的 AccessDeniedException 没人接，会一路冒到 Spring MVC 默认处理变成 500）。
 package com.example.interview.config;
 
+import com.example.interview.application.AiUpstreamException;
+import com.example.interview.application.AuthException;
+import com.example.interview.application.NotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
@@ -12,6 +15,41 @@ import java.util.Map;
 
 @RestControllerAdvice
 public class ApiExceptionHandler {
+
+    // 从这里开始是新增的：两个 HTTP 语义修正。
+    // 401：认证失败（密码错、没带 token、token 无有效身份）。
+    // 之前这些抛的是 IllegalArgumentException / IllegalStateException，
+    // 分别被映射成 400 / 409——前端只会当成"参数错/状态冲突"，不会跳登录页。
+    @ExceptionHandler(AuthException.class)
+    public ResponseEntity<Map<String, Object>> unauthorized(
+            AuthException error
+    ) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(Map.of("message", error.getMessage()));
+    }
+
+    // 404：目标资源不存在（岗位/简历/报告）。之前是 400，语义同样偏了。
+    @ExceptionHandler(NotFoundException.class)
+    public ResponseEntity<Map<String, Object>> notFound(
+            NotFoundException error
+    ) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(Map.of("message", error.getMessage()));
+    }
+    // 新增结束
+
+    // 从这里开始是新增的：502 上游模型故障。
+    // 简历技能抽取失败（超时 / 限流重试耗尽 / 模型返回的不是 JSON 数组）属于
+    // "服务端依赖出错"，不是客户端参数错。早先抛 IllegalArgumentException 会被
+    // 映射成 400，前端只会当成自己传错了文件、不会重试。502 才表达"网关后端坏了"。
+    @ExceptionHandler(AiUpstreamException.class)
+    public ResponseEntity<Map<String, Object>> badGateway(
+            AiUpstreamException error
+    ) {
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(Map.of("message", error.getMessage()));
+    }
+    // 新增结束
 
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, Object>> badRequest(

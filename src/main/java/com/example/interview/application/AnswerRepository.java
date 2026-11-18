@@ -101,7 +101,15 @@ public class AnswerRepository {
         }
         entity.setScore(result.score());
         entity.setFeedback(result.feedback());
-        // 评分成功后更新状态为 JUDGED，避免下一轮补偿服务继续扫描该记录。
+        // 从这里开始是新增的：把围栏令牌一起落库。
+        // 为什么必须写：judge 的「回放分支」会读 persisted.fencingToken() 去构造
+        // WorkflowResult，而那个字段是 long（基本类型），读到 null 就拆箱 NPE。
+        // 原来这里只写 score/feedback/status，令牌永远是 NULL —— 结果就是
+        // 「评分第一次正常，一旦重试必然 NPE」，重试三次全挂、消息进死信，
+        // 整条面试就卡在 JUDGING。这个 bug 只在重试时出现，所以平时跑不出来。
+        entity.setFencingToken(result.fencingToken());
+        // 新增结束
+        // 评分成功后把状态写成 JUDGED：前端与报告模块靠它判断这道题评完没有。
         entity.setStatus("JUDGED");
         mapper.updateById(entity);
     }

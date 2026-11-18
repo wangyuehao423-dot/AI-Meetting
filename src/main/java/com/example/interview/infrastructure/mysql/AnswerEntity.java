@@ -5,7 +5,7 @@ import com.baomidou.mybatisplus.annotation.TableName;
 import java.time.LocalDateTime;
 
 // 一次面试题答案及其异步评分状态。
-// 对应 interview_answer 表，包含答案正文、评分结果和补偿控制字段。
+// 对应 interview_answer 表，包含答案正文、评分结果和评分状态字段。
 @TableName("interview_answer")
 public class AnswerEntity {
     // 数据库自增主键。
@@ -24,9 +24,9 @@ public class AnswerEntity {
     private String feedback;
     // 围栏令牌，用于防止旧评分结果覆盖新评分结果。
     private Long fencingToken;
-    // 答案创建时间，用于补偿服务判断评分是否超时。
+    // 答案创建时间，报告生成前判断"最后几题是不是还没评完"时会用到。
     private LocalDateTime createdAt;
-    // 补偿重试次数，每次补偿服务扫描处理时递增。
+    // 重投计数：队列时代的重试次数记在消息体 retryCount 里，这一列保留为历史字段（只读、排查用）。
     private Integer retryCount;
     // 从这里开始是新增的：追问作答标记，对应 interview_answer.is_follow_up 列。
     // 为什么用 Integer 而不是 boolean：MyBatis-Plus 把基本类型 boolean 映射到 TINYINT 时
@@ -37,7 +37,8 @@ public class AnswerEntity {
     // 所以必须靠这个标记把"同一道题的初次评分"和"追问评分"区分成两行，避免互相覆盖。
     private Integer isFollowUp;
     // 新增结束
-    // 答案状态：PENDING_JUDGE（待评分）、JUDGED（已评分）、JUDGE_FAILED（评分失败）。
+    // 答案状态：SUBMITTED（已提交待评分）、JUDGED（已评分）。
+    // 不再有 JUDGE_FAILED：评分失败由队列重试，重试耗尽进死信，不靠状态字段标记失败。
     private String status;
 
     public Long getId() {
@@ -120,7 +121,7 @@ public class AnswerEntity {
         this.retryCount = retryCount;
     }
 
-    // 从这里开始是新增的：isFollowUp 的读写方法，供仓储层写入与补偿服务读取。
+    // 从这里开始是新增的：isFollowUp 的读写方法，供仓储层写入、报告模块读取。
     public Integer getIsFollowUp() {
         return isFollowUp;
     }

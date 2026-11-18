@@ -11,6 +11,8 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 /**
@@ -22,6 +24,18 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/reports")
 public class ReportController {
+
+    /**
+     * 「生成中」的有效窗口。
+     *
+     * <p>为什么要一个时间窗而不是只看状态：只看状态的话，消费者一崩、状态就永远停在
+     * GENERATING，用户再也点不出新的一份（僵尸状态）。给个上限后语义变成
+     * 「10 分钟内还当它正在跑，超过就认为这条任务已经死了，允许重新投递」。</p>
+     *
+     * <p>取 10 分钟的依据：正常一份报告 30~120 秒，e2e 里实测 75 秒；
+     * 留 5 倍余量足以覆盖上游变慢，又不会让用户等太久。</p>
+     */
+    private static final Duration GENERATING_TTL = Duration.ofMinutes(10);
 
     // 报告视图：把"状态 + 内容"打包一起返回前端。
     // markdown 只在 status=COMPLETED 时才有值，其它状态下是 null，
@@ -35,8 +49,10 @@ public class ReportController {
 
     // 报告表 Mapper：查询 / 插入 / 更新 report 记录。
     private final ReportMapper reports;
-    // 报告生成异步服务：generate 上带 @Async，调用即返回，不占用 HTTP 线程。
-    private final ReportGenerationAsyncService generation;
+    // 报告任务投递器：report 行建好之后投一条消息进 RabbitMQ。
+    // 为什么不再直接调 ReportGenerationAsyncService：@Async 的缺口是 JVM 崩溃时
+    // 正在生成的任务直接蒸发、状态永远停在 GENERATING；走队列后消息没 ack 会自动 requeue。
+    private final ReportTaskPublisher publisher;
     // 会话表 Mapper：只用来查会话归属，做"这份报告是不是你的"权限校验。
     private final InterviewSessionMapper sessions;
     // 当前登录用户提供者：从 JWT 解析出 userId，供所有者校验使用。
@@ -45,12 +61,12 @@ public class ReportController {
     // 构造器注入四个协作者，字段全是 final，Controller 保持无状态、线程安全。
     public ReportController(
             ReportMapper reports,
-            ReportGenerationAsyncService generation,
+            ReportTaskPublisher publisher,
             InterviewSessionMapper sessions,
             CurrentUserIdProvider currentUser
     ) {
         this.reports = reports;
-        this.generation = generation;
+        this.publisher = publisher;
         this.sessions = sessions;
         this.currentUser = currentUser;
     }
@@ -82,6 +98,8 @@ public class ReportController {
                         // 用字符串比较：库里 session_id 存的是 varchar，不是二进制 UUID。
                         .eq("session_id", sessionId.toString())
         );
+        // 是否本次新建了记录——新建的本身就是要投递的那一次，不需要再抢占。
+        boolean created = false;
         if (entity == null) {
             // 从这里开始是新增的：并发安全地创建报告记录。
             // 为什么会并发：报告页一进入会同时触发两次 loadReport（useEffect 一次、
@@ -90,14 +108,15 @@ public class ReportController {
             // unique(session_id) 只允许一条成功，另一条会抛 DuplicateKeyException，
             // 让接口直接 500 —— 前端把这次 500 静默吞掉后继续轮询，界面就一直停在
             // "正在生成"出不来。所以这里把创建包起来：插入冲突就回查出已存在的记录，
-            // 统一走下面的"重置状态 + 重新生成"分支，保证并发触发幂等、绝不 500。
+            // 走下面的原子抢占，保证并发触发幂等、绝不 500。
             entity = new ReportEntity();
             entity.setSessionId(sessionId.toString());
             entity.setStatus("GENERATING");
             try {
                 reports.insert(entity);
+                created = true;
             } catch (DuplicateKeyException duplicate) {
-                // 另一并发请求已抢先插入：把这条记录重新查出来继续走生成；
+                // 另一并发请求已抢先插入：把这条记录重新查出来继续走抢占；
                 // 若查不到（行被并发删除的极端情况），恢复抛出，避免拿着 null 往下走到 NPE。
                 entity = reports.selectOne(
                         new QueryWrapper<ReportEntity>()
@@ -106,26 +125,58 @@ public class ReportController {
                 if (entity == null) {
                     throw duplicate;
                 }
-                entity.setStatus("GENERATING");
-                entity.setContent(null);
-                reports.updateById(entity);
             }
             // 新增结束
-        } else {
-            // 重新生成：状态回到 GENERATING，同时清空旧内容，
-            // 避免前端在生成过程中还翻到上一版报告。
-            entity.setStatus("GENERATING");
-            entity.setContent(null);
-            reports.updateById(entity);
         }
-        // 触发异步生成：@Async 让这次调用立刻返回，HTTP 线程不等待 AI。
-        generation.generate(sessionId, entity.getId());
-        // 同步返回"已受理"的状态，此刻 content 必然是 null。
-        return new ReportView(
-                sessionId,
-                entity.getStatus(),
-                entity.getContent()
-        );
+
+        // 从这里开始是新增的：已完成就直接返回，绝不再重新生成。
+        // 不写这一段的话，下面那条原子 UPDATE 的条件是「状态不是 GENERATING」——
+        // COMPLETED 恰好满足，于是"再点一次生成报告"会把已经生成好的正文清空、
+        // 状态打回 GENERATING、重新投递一次任务。演示时肉眼看到的就是：报告本来
+        // 已经出来了，再点一下它就变回"生成中"，白等一两分钟，内容还短暂消失。
+        // 报告是"一次性产物"，重复触发应当是幂等读，不是重算。
+        if (!created
+                && "COMPLETED".equals(entity.getStatus())
+                && entity.getContent() != null
+                && !entity.getContent().isBlank()) {
+            return new ReportView(sessionId, "COMPLETED", entity.getContent());
+        }
+        // 新增结束
+
+        if (!created) {
+            // 从这里开始是修改的：用一条原子 UPDATE 同时做三件事——抢占生成权、
+            // 清空旧正文、刷新 updated_at。原来的写法是「读出来判状态 → setXxx → updateById」，
+            // 三个问题都踩了：
+            //   ① 判断和写入不在一个原子操作里，两次请求几乎同时到达时都读到旧状态，都会投递；
+            //   ② MyBatis-Plus 的 updateById 默认忽略 null 字段，setContent(null) 根本没写进库，
+            //      于是"生成中"的报告还能读到上一版正文；
+            //   ③ entity.updatedAt 带着旧值参与更新，反而把 ON UPDATE CURRENT_TIMESTAMP
+            //      覆盖掉了——时间戳不动，"10 分钟算不算在跑"就永远判不出来。
+            // 现在把条件写进 WHERE：只有「不在生成中，或上次更新已超过 TTL」才抢得到。
+            // 影响行数 0 = 别人正在生成，直接返回当前状态，不投递。
+            int affected = reports.update(
+                    null,
+                    new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ReportEntity>()
+                            .eq("id", entity.getId())
+                            .and(w -> w.isNull("status")
+                                    .or().ne("status", "GENERATING")
+                                    .or().lt("updated_at", LocalDateTime.now().minus(GENERATING_TTL)))
+                            .set("status", "GENERATING")
+                            .set("content", null)
+                            .set("updated_at", LocalDateTime.now())
+            );
+            if (affected == 0) {
+                // 已有人在跑：不再投递，避免多条任务并发生成同一份报告。
+                return new ReportView(sessionId, "GENERATING", null);
+            }
+            // 修改结束
+        }
+
+        // 投递报告任务进 RabbitMQ：接口立刻返回，HTTP 线程不等待 AI。
+        // 消费者生成完成会写 COMPLETED，前端轮询 /status 拿终态。
+        publisher.publish(sessionId, entity.getId());
+        // 同步返回"已受理"的状态，此刻正文已被上面的 UPDATE 清空。
+        return new ReportView(sessionId, "GENERATING", null);
     }
 
     /**
@@ -203,7 +254,7 @@ public class ReportController {
         );
         if (entity == null) {
             // 记录不存在：可能是 sessionId 编造的，按"资源不存在"处理。
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                     "report not found"
             );
         }
@@ -227,7 +278,7 @@ public class ReportController {
                 sessions.selectById(sessionId.toString());
         if (session == null) {
             // 会话都不存在，说明 sessionId 非法，按"资源不存在"处理。
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                     "interview session not found"
             );
         }

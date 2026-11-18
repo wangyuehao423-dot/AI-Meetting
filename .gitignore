@@ -22,3 +22,10 @@ frontend-launcher.bat
 AI-Meetting-原始副本.md
 q-a.sql
 resume-test.pdf
+
+# 例外：发布提示词到 Nacos 的脚本是部署流程的一部分，必须进版本库。
+# 它在上面被 *.ps1 一并忽略了，这里单独放出来——否则 README 里写的命令 clone 下来不存在。
+!scripts/publish-skills-to-nacos.ps1
+
+# WorkBuddy 本地工作区数据（会话记忆等），不进版本库
+.workbuddy/

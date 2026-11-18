@@ -1,162 +1,98 @@
 package com.example.interview.application;
 
+import com.example.interview.config.RabbitConfig;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import org.springframework.data.redis.connection.RedisListCommands.Direction;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Async;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.util.UUID;
 
+/**
+ * 评分任务投递器：把消息放进主队列 / 延迟重试队列 / 死信队列。
+ *
+ * <h3>为什么这个类只负责「发」，不再负责「取」</h3>
+ * 原来是「发布 + 消费 + 重试 + 死信」挤在一个类里（pullOnce / consumeOnce / retryOrDeadLetter），
+ * 因为 Redis List 没有消费端语义，只能自己写循环去拉。换成 RabbitMQ 之后，
+ * 消费由 {@code @RabbitListener} 驱动、ack 由 Channel 控制，这些都不再需要手写。
+ * 职责一分开，「投递」和「消费」各自的失败面就独立了。
+ *
+ * <h3>publisher confirm 干什么</h3>
+ * {@code rabbitTemplate.convertAndSend} 返回得很快，但它只代表「方法没抛异常」，
+ * 不代表消息真的进了 broker 的队列。发布那一刻 broker 挂了、交换机路由不到队列，
+ * 消息就静默丢了——而库里那条答案还停在「待评分」，没有任何人会来救它。
+ * 开启 correlated confirm 之后，「发布成功」变成一个可确认的事实，没确认就打日志告警。
+ */
 @Service
 public class JudgeTaskPublisher {
-    private static final String QUEUE = "interview:task:judge";
 
-    private static final String PROCESSING = "interview:task:judge:processing";
+    private static final Logger log = LoggerFactory.getLogger(JudgeTaskPublisher.class);
 
-    private static final String DEAD = "interview:task:judge:dead";
-
-    private static final int MAX_RETRY = 3;
-
-    // 评分工作流：真正执行"AI 评分 + 落库 + 推进状态 + 触发追问"的那一环。
-    // 全类只声明这一次，构造器注入一次，避免重复字段导致编译报错。
-    private final InterviewWorkflowService workflow;
-
-    private final StringRedisTemplate redis;
+    private final RabbitTemplate rabbit;
     private final ObjectMapper mapper;
 
-    public JudgeTaskPublisher(
-            StringRedisTemplate redis,
-            ObjectMapper mapper,
-            InterviewWorkflowService workflow
-    ) {
-        this.redis = redis;
+    public JudgeTaskPublisher(RabbitTemplate rabbit, ObjectMapper mapper) {
+        this.rabbit = rabbit;
         this.mapper = mapper;
-        this.workflow = workflow;
-    }
-
-    public void publish(UUID sessionId, UUID questionId, String answer,
-                        // 从这里开始是修改的：新增 followUp 参数。
-                        // 追问作答与初次作答共用同一条评分队列，队列载荷必须带上这个标记，
-                        // 否则消费者无法区分"该写哪一行、该不该推进状态机"。
-                        boolean followUp)
-                        // 修改结束
-    {
-        try
-        {
-            // 从这里开始是修改的：构造 JudgeTask 时带上 followUp（位置在 retryCount 之前，末位仍传 0 表示首次投递）。
-            redis.opsForList().rightPush(QUEUE, mapper.writeValueAsString(new JudgeTask(sessionId, questionId, answer, followUp, 0)));
-            // 修改结束
-
-        }
-        catch(JsonProcessingException e)
-        {
-            // 什么情况下会走到这里：ObjectMapper 无法序列化 JudgeTask。
-            // 实际上 JudgeTask 是一个 record，字段都是基本类型+String+UUID，
-            // 几乎不可能序列化失败。
-            // 但是 Jackson 声明抛出 JsonProcessingException，我们必须处理。
-            // 这里包装为 IllegalStateException（非受检异常），
-            // 让调用方不需要显式 try-catch，简化 controller 层的代码。
-            throw new IllegalStateException(
-                    "无法序列化评分任务: sessionId=" + sessionId
-                            + ", questionId=" + questionId,
-                    e
-            );
-        }
-    }
-
-    @Async("aiScoringTaskExecutor")
-    public void consumeOnce()
-    {
-        String raw = redis.opsForList().rightPopAndLeftPush(QUEUE, PROCESSING,Duration.ofMillis(200));
-        if(raw == null)
-        {
-            return;
-        }
-        JudgeTask task = null;
-        try
-        {
-            task = mapper.readValue(raw, JudgeTask.class);
-            // 从这里开始是修改的：把队列载荷里的 followUp 透传给工作流，追问作答才不会推进主线。
-            workflow.judge(task.sessionId(), task.questionId(), task.answer(), task.followUp());
-            // 修改结束
-            redis.opsForList().remove(PROCESSING,1,raw);
-        }
-        catch(Exception e)
-        {
-            retryOrDeadLetter(raw,task);
-        }
     }
 
     /**
-     * 同步拉取并处理一条评分任务。
+     * 注册发布确认回调：只记日志，不在这里重发。
      *
-     * <p>判定依据是队列搬运是否返回 null——返回 null 就说明待处理队列此刻没有任务，
-     * 本轮无事可做。之所以在 {@code consumeOnce()} 之外再开一个方法：{@code consumeOnce()}
-     * 上有 {@code @Async}，调用后会立刻返回，不能用来"循环拉取"；本方法保持同步语义，
-     * 处理完才返回，正好放进 {@code JudgeTaskConsumerLoop} 的定时循环里。
-     *
-     * @return 本次是否消费到任务：true 表示确实拿到并处理了一条，false 表示队列已空
+     * <p>为什么不自动重发：重发需要知道「发的是哪条任务」，而回调里只有 correlationData。
+     * 更稳的兜底是「库里那条答案还是待评分」——真有消息丢了，按状态扫一遍就能补，
+     * 比在回调里做一次不确定是否成功重试更可靠。
      */
-    public boolean pullOnce()
-    {
-        // 把队首元素从 QUEUE 原子地搬到 PROCESSING：中间没有"取出来了但还没登记"的窗口，
-        // 消费者此刻崩溃任务也还留在处理中队列里，补偿服务才能查得到并重投。
-        // 从左边取是因为 publish 用的是 rightPush——右侧进、左侧出，先到先处理。
-        // 这里是非阻塞版本：拿不到就返回 null，由外层 @Scheduled 反复调用，不会挂起线程。
-        String raw = redis.opsForList().move(QUEUE, Direction.LEFT, PROCESSING, Direction.LEFT);
-        // 返回 null 说明 QUEUE 已经空了，本轮没有任务可处理。
-        if(raw == null)
-        {
-            return false;
-        }
-        JudgeTask task = null;
-        try
-        {
-            // 反序列化后立刻执行评分工作流：AI 评分 → 落库 → 推进状态 → 触发追问。
-            task = mapper.readValue(raw, JudgeTask.class);
-            // 从这里开始是修改的：pullOnce 同样要把 followUp 透传下去（追问任务重投后仍保持追问语义）。
-            workflow.judge(task.sessionId(), task.questionId(), task.answer(), task.followUp());
-            // 修改结束
-            // 评分成功，把任务从处理中队列摘掉，表示这条已经处理完毕。
-            redis.opsForList().remove(PROCESSING,1,raw);
-        }
-        catch(Exception e)
-        {
-            // 任何环节失败（反序列化 / AI 评分 / 落库）都交给重投或死信，
-            // 避免任务永远留在处理中队列里没人管。
-            retryOrDeadLetter(raw,task);
-        }
-        return true;
+    @PostConstruct
+    void registerConfirmCallback() {
+        rabbit.setConfirmCallback((correlationData, ack, cause) -> {
+            if (!ack) {
+                log.error("评分/报告消息未被 broker 确认，可能已丢失: id={} cause={}",
+                        correlationData == null ? "null" : correlationData.getId(), cause);
+            }
+        });
+        rabbit.setReturnsCallback(returned ->
+                log.error("消息无法路由到队列: exchange={} routingKey={} reply={}",
+                        returned.getExchange(), returned.getRoutingKey(), returned.getReplyText()));
     }
-    public void retryOrDeadLetter(String raw, JudgeTask task)
-    {
-        if(task == null || task.retryCount() >= MAX_RETRY)
-        {
-            redis.opsForList().rightPush(DEAD, raw);
-            redis.opsForList().remove(PROCESSING, 1, raw);
-            return;
-        }
-        try
-        {
-            // 从这里开始是修改的：重投时原样保留 followUp，只递增 retryCount，
-            // 保证追问任务重投后仍走"不推进主线"的追问分支。
-            JudgeTask retry = new JudgeTask(task.sessionId(), task.questionId(), task.answer(), task.followUp(), task.retryCount() + 1);
-            // 修改结束
-            redis.opsForList().rightPush(QUEUE, mapper.writeValueAsString(retry));
-            redis.opsForList().remove(PROCESSING, 1, raw);
-        }
-        catch(JsonProcessingException serializationError)
-        {
-            throw new IllegalStateException(
-                    "无法序列化重试任务: sessionId="
-                            + task.sessionId()
-                            + ", questionId=" + task.questionId(),
-                    serializationError
-            );
+
+    /**
+     * 提交答案后投递评分任务。
+     *
+     * <p>返回即代表「已投递」，不代表「已评分」——接口立刻返回给用户，
+     * 真正的 AI 调用在消费者那边跑。
+     */
+    public void publish(UUID sessionId, UUID questionId, String answer, boolean followUp) {
+        send(RabbitConfig.JUDGE_QUEUE, new JudgeTask(sessionId, questionId, answer, followUp, 0));
+    }
+
+    /** 可重试失败：投延迟队列，TTL 到期后经死信交换机自动回主队列 */
+    public void retryLater(JudgeTask task) {
+        send(RabbitConfig.JUDGE_RETRY_QUEUE, task);
+    }
+
+    /** 重试超限 / 不可重试：进死信，原样留现场 */
+    public void deadLetter(JudgeTask task) {
+        send(RabbitConfig.JUDGE_DEAD_QUEUE, task);
+    }
+
+    private void send(String routingKey, Object task) {
+        try {
+            String payload = mapper.writeValueAsString(task);
+            rabbit.convertAndSend(routingKey, payload, message -> {
+                // persistent：broker 重启后消息不丢。默认就是 persistent，
+                // 显式写出来是为了让「这条消息必须活过重启」在代码里可见。
+                message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                return message;
+            });
+            log.info("已投递 queue={} payload={}", routingKey, payload);
+        } catch (JsonProcessingException e) {
+            // 载荷是 record + 基本类型，序列化失败属于程序错误，直接抛
+            throw new IllegalStateException("无法序列化评分任务", e);
         }
     }
 }

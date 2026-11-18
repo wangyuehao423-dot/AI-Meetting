@@ -1,9 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-// 从这里开始是新增的：阿里云 NLS 实时转写客户端（麦克风采集 → 16k PCM → NLS → 分片上报后端）。
-// 原来这段录音逻辑是"MediaRecorder 录完就丢"的占位实现，换成真实链路。
-import { NlsTranscriptionClient } from './nlsTranscriptionClient';
-// 新增结束
 
 const API_ROOT = import.meta.env.VITE_API_ROOT || '';
 
@@ -113,24 +109,18 @@ function App() {
   const [followUp, setFollowUp] = useState(null);
   // 新增结束
   const [answer, setAnswer] = useState('');
-  const [transcript, setTranscript] = useState('');
   const [report, setReport] = useState(null);
   const [screen, setScreen] = useState('SETUP');
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [recording, setRecording] = useState(false);
-  // 从这里开始是修改的：原来这里是 MediaRecorder 的 ref，现在换成 NLS 转写客户端
-  // （它内部自己持有两条 WebSocket 与 AudioContext，stop() 时统一释放）。
-  const nlsClient = useRef(null);
   // 面试 WebSocket 的 ref：会话开始时建立，页面卸载或会话切换时关闭。
   const socketRef = useRef(null);
-  // 修改结束
   const requestIdRef = useRef(null);
 
   const userId = user?.userId;
-  const currentAnswer = useMemo(() => (answer || transcript).trim(), [answer, transcript]);
+  const currentAnswer = useMemo(() => answer.trim(), [answer]);
 
   useEffect(() => {
     if (!user) return;
@@ -241,8 +231,10 @@ function App() {
   // 为什么必须等到终态而不是轮询固定次数就停：之前触发生成后只轮询 60 次，若 AI 生成慢，
   // 60 秒后轮询结束、拿到的还是 GENERATING，界面就永远卡在"报告状态：GENERATING"，
   // 其实后端还在跑、稍后会 COMPLETED/FAILED，只是前端不再等。
-  const pollReportUntilSettled = async (maxAttempts = 90) => {
-    // 单轮最多等 maxAttempts 秒（默认 90 秒）：AI 生成报告通常几十秒内完成。
+  const pollReportUntilSettled = async (maxAttempts = 150) => {
+    // 单轮最多等 maxAttempts 秒（默认 150 秒，实测报告约 96 秒完成）。
+    // 原来是 90 秒：实测一份报告 96 秒才 COMPLETED，90 秒一到就得走下面的兜底重触发，
+    // 多打一次 POST。留足余量能少一次无谓的重触发。
     // 若这一轮等完仍是 GENERATING，本方法会把后端最新状态返回给调用方（loadReport），
     // 由调用方决定是否做"兜底重触发"；这里只负责"等价满一轮之后带着最新状态返回"，
     // 不再像之前那样自己无限等下去——无限等只会让界面永远停在"生成中"。
@@ -390,9 +382,6 @@ function App() {
     return () => {
       socketRef.current?.close();
       socketRef.current = null;
-      // 离开答题页时把还在跑的语音输入也停掉，否则麦克风会一直占着。
-      nlsClient.current?.stop();
-      nlsClient.current = null;
     };
   }, [session?.sessionId]);
   // 新增结束
@@ -439,24 +428,37 @@ function App() {
   // 直接把错误抛给用户，红色报错卡在答题页。这里统一做"有限次重取 + 校验 ACTIVE"：
   // 失败或不就绪就等 1.5 秒再来一次，直到拿到一道可答的 ACTIVE 题，或超时明确报错。
   const takeQuestion = async sessionId => {
-    const maxAttempts = 10; // 单题最多等约 10*1.5=15 秒：首题生成通常几十秒内完成。
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // 按「总时长」等，最多 150 秒，而不是按次数。
+    // 后端取题接口在评分/追问未闭环时会先等一小会儿再回 409（现在是 20 秒内就回），
+    // 所以单次请求本身也可能占用十几秒——用固定次数会算不准总时长。
+    // 为什么不是原来的 10 次 × 1.5 秒 = 15 秒：后端出下一题要先等这道题的异步评分跑完，
+    // 再跑一条追问链，实测第 2/3 题稳定要 26~58 秒。15 秒一到前端就抛"题目生成超时"，
+    // 演示时就是"点了提交，红字报错，题不出来"——其实后端还在正常干活。
+    const deadline = Date.now() + 150000;
+    let round = 0;
+    while (Date.now() < deadline) {
       let next;
       try {
         next = await request(`/api/interviews/${sessionId}/questions`, {
           method: 'POST'
         });
       } catch (error) {
-        // 后端 singleflight 超时会以 500 形式抛出"可重试"信号，这里吞掉后重试，
+        // 后端在"还没就绪"时会回 409/500 作为可重试信号，这里吞掉后继续等，
         // 不把可恢复的生成中态当成失败直接展示给用户。
       }
       // 只有 ACTIVE 的题才可作答：预生成题和中间态都不能展示。
       if (next && next.id && next.status === 'ACTIVE') {
+        setNotice('');
         return next;
+      }
+      round += 1;
+      // 让等待是"看得见"的：否则界面只剩一个转圈按钮，几十秒过去像卡死。
+      if (round === 1) {
+        setNotice('已提交，正在评分并生成下一题，通常 5~30 秒，请稍候…');
       }
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
-    throw new Error('题目生成超时，请稍后刷新重试。');
+    throw new Error('题目生成超时（已等待约 2 分半），请点「刷新会话」后重试。');
   };
   // 新增结束
 
@@ -492,7 +494,6 @@ function App() {
     });
     requestIdRef.current = null;
     setAnswer('');
-    setTranscript('');
 
     // 先等后端把状态推进到位（评分 → 追问裁决 → 预生成下一题），再去取下一题。
     // 旧写法提交返回就立刻要下一题，此时后端还在评分，拿到的还是旧题。
@@ -551,46 +552,6 @@ function App() {
     await loadReport();
   });
 
-  // 从这里开始是修改的：录音从"MediaRecorder 录完就丢"的占位实现，
-  // 换成真实的实时转写链路（NlsTranscriptionClient）：
-  // 麦克风采集 → 降采样成 16k PCM → 推给阿里云 NLS → 把分片按业务协议上报后端，
-  // 后端去重合并后落进 interview_answer.answer。界面上只用 NLS 回来的临时结果做预览。
-  const toggleRecording = async () => {
-    if (recording) {
-      // 停止：关麦克风、关两条 WebSocket、清 ping 定时器都在 stop() 里做。
-      nlsClient.current?.stop();
-      nlsClient.current = null;
-      setRecording(false);
-      setNotice('语音输入已停止，转写文本已随答案上报。');
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError('当前浏览器不支持录音，请使用文本输入。');
-      return;
-    }
-    if (!session) {
-      setError('请先开始面试，再使用语音输入。');
-      return;
-    }
-    try {
-      const client = new NlsTranscriptionClient({
-        sessionId: session.sessionId,
-        // 取 /api/speech/token 时要带上登录态；JwtAuthenticationFilter 认的是 Authorization 头。
-        jwt: localStorage.getItem('interview_token') || '',
-        // 临时结果只做界面预览，最终文本由后端去重合并后统一取。
-        onPreview: text => setTranscript(text),
-        onError: message => setError(message)
-      });
-      nlsClient.current = client;
-      await client.start();
-      setRecording(true);
-    } catch (caught) {
-      nlsClient.current = null;
-      setRecording(false);
-      setError(caught.message || '语音输入启动失败，请改用文本输入。');
-    }
-  };
-  // 修改结束
 
   if (!user) {
     return (
@@ -672,9 +633,12 @@ function App() {
                 <div className="question-meta"><span>{followUp ? 'FOLLOW-UP' : `QUESTION ${question?.index || 1}`}</span><span>{followUp ? (followUp.level || '追问') : (question?.category || position?.name || '综合面试')}</span></div>
                 <h2>{followUp ? followUp.content : (question?.content || question?.question || '正在加载题目...')}</h2>
                 {/* 修改结束 */}
-                <textarea value={answer} onChange={event => setAnswer(event.target.value)} placeholder="输入你的回答，尽量结合具体项目和结果..." />
-                {transcript && <div className="transcript"><small>语音转写</small><p>{transcript}</p></div>}
-                <div className="answer-actions"><button className={`secondary-button ${recording ? 'recording' : ''}`} onClick={toggleRecording}>{recording ? '停止录音' : '开始录音'}</button><button className="primary-button" disabled={submitting} onClick={submit}>{submitting ? '提交中...' : '提交答案'} <span>→</span></button></div>
+                <textarea
+                  value={answer}
+                  onChange={event => setAnswer(event.target.value)}
+                  placeholder="输入你的回答，尽量结合具体项目和结果..."
+                />
+                <div className="answer-actions"><button className="primary-button" disabled={submitting} onClick={submit}>{submitting ? '提交中...' : '提交答案'} <span>→</span></button></div>
                 <button className="finish-button" onClick={finishInterview}>结束面试并查看报告</button>
               </section>
             )}
@@ -719,7 +683,7 @@ h1, h2, p { margin-top: 0; } h1 { margin-bottom: 10px; font-size: clamp(28px, 4v
 .content { width: min(100%, 1050px); padding: 55px 6vw 80px; } .page-heading { display: flex; justify-content: space-between; align-items: start; gap: 24px; margin-bottom: 42px; } .status-chip { display: flex; align-items: center; gap: 8px; padding: 8px 11px; color: #377560; background: #e7f3ed; font-size: 12px; font-weight: 700; } .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #38a878; }
 .setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; } .section-block, .interview-panel, .report-panel { background: #fff; border: 1px solid #d9e3e0; padding: 30px; } .section-title { display: flex; gap: 15px; align-items: flex-start; margin-bottom: 25px; } .number { color: #1c6b5a; font-size: 12px; font-weight: 900; } .position-list { display: grid; gap: 10px; } .position-option { display: flex; justify-content: space-between; gap: 14px; width: 100%; padding: 15px; border: 1px solid #dce6e3; background: #fff; color: #17212b; text-align: left; } .position-option.selected { border-color: #1c6b5a; background: #f1f8f5; } .position-option strong, .position-option small { display: block; } .position-option small, .resume-status small { margin-top: 5px; color: #7c8b8e; font-size: 12px; } .radio { width: 17px; height: 17px; flex: 0 0 auto; border: 2px solid #b6c8c4; border-radius: 50%; } .selected .radio { border: 5px solid #1c6b5a; }
 .upload-box { min-height: 190px; display: grid; align-content: center; justify-items: center; gap: 10px; padding: 24px; border: 1px dashed #9ebdb5; background: #f7fbfa; text-align: center; cursor: pointer; } .upload-box input { display: none; } .upload-icon { display: grid; place-items: center; width: 36px; height: 36px; background: #dceee8; color: #1c6b5a; font-size: 22px; } .upload-box small { color: #81908e; font-weight: 400; } .resume-status { display: flex; align-items: center; gap: 12px; margin-top: 15px; padding: 13px; background: #edf7f2; } .check { color: #16815a; font-size: 20px; } .resume-status strong, .resume-status small { display: block; }
-.question-meta { display: flex; justify-content: space-between; color: #1c6b5a; font-size: 12px; font-weight: 800; letter-spacing: 1px; } .interview-panel h2 { max-width: 760px; margin: 38px 0 24px; font-size: clamp(24px, 4vw, 36px); line-height: 1.4; } .answer-actions { display: flex; justify-content: space-between; gap: 12px; margin-top: 16px; } .recording { color: #b63c35; border-color: #e5aaa5; } .finish-button { display: block; margin: 30px auto 0; padding: 4px; border: 0; background: transparent; color: #7c8b8e; font-size: 13px; } .transcript { margin-top: 12px; padding: 12px 15px; background: #f4f7f7; color: #526166; } .transcript p { margin: 4px 0 0; }
+.question-meta { display: flex; justify-content: space-between; color: #1c6b5a; font-size: 12px; font-weight: 800; letter-spacing: 1px; } .interview-panel h2 { max-width: 760px; margin: 38px 0 24px; font-size: clamp(24px, 4vw, 36px); line-height: 1.4; } .answer-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 16px; } .finish-button { display: block; margin: 30px auto 0; padding: 4px; border: 0; background: transparent; color: #7c8b8e; font-size: 13px; }
 .report-header { display: flex; align-items: start; justify-content: space-between; gap: 16px; border-bottom: 1px solid #e0e8e6; padding-bottom: 25px; margin-bottom: 25px; } .report-document { line-height: 1.8; color: #35454a; } .report-document h1, .report-document h2, .report-document h3 { color: #17212b; margin-top: 28px; } .report-document p { margin-bottom: 14px; } .report-document li { margin: 5px 0; } .report-document code { padding: 2px 5px; background: #edf2f1; } .empty-state { display: grid; place-items: center; gap: 15px; min-height: 250px; color: #718087; } .loader { width: 22px; height: 22px; border: 3px solid #d5e1de; border-top-color: #1c6b5a; border-radius: 50%; animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 800px) { .workspace { display: block; } .sidebar { display: flex; gap: 8px; padding: 12px 18px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #dae4e1; } .sidebar .eyebrow, .sidebar-note { display: none; } .step { min-width: 120px; padding: 10px; border-left: 0; border-bottom: 2px solid transparent; } .step.active { border-bottom-color: #1c6b5a; } .content { padding: 35px 18px 55px; } .setup-grid { grid-template-columns: 1fr; } .page-heading { display: block; margin-bottom: 28px; } .status-chip { width: fit-content; margin-top: 18px; } .section-block, .interview-panel, .report-panel { padding: 22px; } }
 @media (max-width: 480px) { .auth-panel { padding: 28px 22px; } .topbar { padding: 0 18px; } .user-actions span { display: none; } .answer-actions { flex-direction: column-reverse; } .answer-actions button { width: 100%; } }

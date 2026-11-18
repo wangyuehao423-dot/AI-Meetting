@@ -3,7 +3,7 @@ package com.example.interview.application;
 import java.util.UUID;
 
 /**
- * 追问任务的不可变数据模型，作为 Redis 队列中传递的载荷。
+ * 追问任务的不可变数据模型，作为 RabbitMQ 消息体传递的载荷。
  *
  * @param sessionId  面试会话 ID，用于关联会话数据
  * @param questionId 题目 ID，用于关联当前题目

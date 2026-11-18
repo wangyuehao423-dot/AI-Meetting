@@ -52,7 +52,7 @@ public class SessionRecoveryService {
     private final AnswerEntityMapper answers;
     // 新增结束
     private final ReportMapper reports;
-    private final ReportGenerationAsyncService generation;
+    private final ReportTaskPublisher reportPublisher;
     private final NextQuestionPreGeneratorService preGenerator;
 
     public SessionRecoveryService(
@@ -62,14 +62,14 @@ public class SessionRecoveryService {
             AnswerEntityMapper answers,
             // 新增结束
             ReportMapper reports,
-            ReportGenerationAsyncService generation,
+            ReportTaskPublisher reportPublisher,
             NextQuestionPreGeneratorService preGenerator
     ) {
         this.snapshots = snapshots;
         this.questions = questions;
         this.answers = answers;
         this.reports = reports;
-        this.generation = generation;
+        this.reportPublisher = reportPublisher;
         this.preGenerator = preGenerator;
     }
 
@@ -153,8 +153,20 @@ public class SessionRecoveryService {
             // 没有报告（用户还没点过生成）或已生成完：不属于"中断待补"，无需动作。
             return;
         }
-        // 重建生成：异步接口立即返回，不阻塞恢复调用。
-        generation.generate(sessionId, report.getId());
+        // 从这里开始是新增的：真在跑就不要重投。
+        // 原来这里只看「不是 COMPLETED 就重投」，于是报告正常生成到一半时用户
+        // 刷新页面（前端会调 recover），就多出来一条并发任务，和正在跑的那条
+        // 抢同一行记录、重复调模型。判据和 ReportController 用同一个窗口：
+        // 10 分钟内 updated_at 还在动 = 有人正在跑，直接跳过。
+        if ("GENERATING".equals(report.getStatus()) && report.getUpdatedAt() != null
+                && report.getUpdatedAt().isAfter(
+                        java.time.LocalDateTime.now().minus(java.time.Duration.ofMinutes(10)))) {
+            actions.add("report generation already in progress, skip re-trigger");
+            return;
+        }
+        // 新增结束
+        // 重建生成：投一条报告任务进队列，恢复调用立即返回。
+        reportPublisher.publish(sessionId, report.getId());
         actions.add("re-trigger report generation (previous status="
                 + report.getStatus() + ")");
     }

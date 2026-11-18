@@ -3,18 +3,18 @@ package com.example.interview.application;
 import java.util.UUID;
 
 /**
- * 评分任务在 Redis 队列里的载荷对象。
+ * 评分任务在 RabbitMQ 里的载荷对象（消息体就是它的 JSON）。
  * <p>
  * 为什么用 record：
  * 1. 任务是只读的，投递进队列之后不会再被修改；
- * 2. 只装"重新执行一次评分"所必需的最小上下文，消费者与补偿线程拿到后据此重建评分调用；
+ * 2. 只装"重新执行一次评分"所必需的最小上下文，消费者拿到后据此重建评分调用；
  * 3. 字段都是基本类型 + String + UUID，Jackson 序列化 / 反序列化不会出意外。
  * </p>
  * <p>
  * 注意：这个类只描述"队列里传什么"。AI 返回后解析出来的结果对象是
  * {@link JudgeResult}（score / feedback / fencingToken / stale），两者字段不同，
  * 不要混用。本文件之前被误写成了 JudgeResult 的字段，导致
- * {@code JudgeTaskPublisher}、{@code JudgeTaskCompensationService} 全部编译不过，
+ * {@code JudgeTaskPublisher} 全部编译不过，
  * 现已改回队列载荷的形状。
  * </p>
  *
@@ -23,8 +23,8 @@ import java.util.UUID;
  * @param answer     候选人答案原文，评分时直接送给 AI
  * @param followUp   是否追问作答：false=初次作答、true=追问作答。
  *                   消费者据此决定评分写回哪一行（is_follow_up），以及是否推进主线状态机；
- *                   重试 / 补偿重投时必须原样保留，否则追问任务会被当成初次作答错误处理。
- * @param retryCount 已重试次数：投递时为 0，重试与补偿各 +1，超过上限转死信队列
+ *                   重投（延迟重试）时必须原样保留，否则追问任务会被当成初次作答错误处理。
+ * @param retryCount 已重试次数：投递时为 0，每次转延迟重试队列 +1，超过上限转死信队列
  */
 public record JudgeTask(
     UUID sessionId,

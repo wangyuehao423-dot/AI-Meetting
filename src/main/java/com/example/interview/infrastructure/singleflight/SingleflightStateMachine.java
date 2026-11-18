@@ -40,6 +40,13 @@ public class SingleflightStateMachine {
     private static final String FIELD_STATE = "state";
     private static final String FIELD_FENCE = "fence";
     private static final String FIELD_REASON = "reason";
+    // 心跳字段：执行方每隔 2 秒把"我还在跑"的时间戳写进来。
+    // 等待方靠它区分两件完全不同的事——"跑得慢"（继续等）与"执行方进程已经没了"（立刻接管）。
+    private static final String FIELD_HEARTBEAT = "hb";
+    // 心跳超时：8 秒没有新心跳就判定执行方死亡。
+    // 取 8 秒的理由：心跳间隔 2 秒，允许连丢 3 拍（一次长 GC、一次网络抖动都不会误杀），
+    // 又远小于原来 30 秒的盲等——真挂了，等待方 8 秒就能接管，而不是白等满 30 秒。
+    public static final long HEARTBEAT_TIMEOUT_MS = 8_000;
 
     /**
      * 请求生命周期状态。
@@ -188,6 +195,77 @@ public class SingleflightStateMachine {
     public void markReason(String key, String reason) {
         // 只存失败原因摘要（类名或简短说明），不放完整堆栈，避免撑大 Redis value。
         redis.opsForHash().put(STATE_PREFIX + key, FIELD_REASON, reason);
+    }
+
+    /**
+     * 读取失败原因（没有失败过就返回空串）。
+     *
+     * @param key 业务 key
+     */
+    public String reason(String key) {
+        Object raw = redis.opsForHash().get(STATE_PREFIX + key, FIELD_REASON);
+        return raw == null ? "" : raw.toString();
+    }
+
+    /**
+     * 执行方打一拍心跳：把自己的存活时间戳写进状态 Hash。
+     *
+     * <p>为什么写进同一个 Hash 而不是单独的 key：等待方本来就要读状态，
+     * 状态和心跳放在同一次读取里，少一次网络往返，也不会出现"状态读到了、
+     * 心跳还没读到"的中间态。
+     *
+     * @param key 业务 key
+     */
+    public void touchHeartbeat(String key) {
+        String redisKey = STATE_PREFIX + key;
+        redis.opsForHash().put(
+                redisKey,
+                FIELD_HEARTBEAT,
+                Long.toString(System.currentTimeMillis())
+        );
+        // 续期：心跳在写、说明这次请求还活着，状态记录不能被 TTL 先清掉。
+        redis.expire(redisKey, STATE_TTL);
+    }
+
+    /**
+     * 距离上一次心跳过了多久。
+     *
+     * @param key 业务 key
+     * @return 毫秒数；从未打过心跳返回 -1（执行方可能刚抢到锁、还没写第一拍）
+     */
+    public long heartbeatAgeMs(String key) {
+        Object raw = redis.opsForHash().get(STATE_PREFIX + key, FIELD_HEARTBEAT);
+        if (raw == null) {
+            return -1L;
+        }
+        try {
+            long last = Long.parseLong(raw.toString());
+            return System.currentTimeMillis() - last;
+        } catch (NumberFormatException broken) {
+            // 值被写坏时按"没有心跳"处理，让等待方走原来的兜底超时，而不是直接崩。
+            return -1L;
+        }
+    }
+
+    /**
+     * 执行方是否还活着：状态是 RUNNING，且心跳没有超时。
+     *
+     * <p>三种情况的语义要分清：
+     * <ul>
+     *   <li>没有心跳记录（-1）：执行方刚抢到锁、第一拍还没写，按"活着"处理，继续等；</li>
+     *   <li>心跳在超时窗口内：正常在跑，继续等；</li>
+     *   <li>心跳超过 8 秒没更新：进程大概率被 kill / 卡死，等待方应当接管，不能再等。</li>
+     * </ul>
+     *
+     * @param key 业务 key
+     */
+    public boolean executorAlive(String key) {
+        if (current(key) != State.RUNNING) {
+            // 不在 RUNNING 状态谈不上"执行方活着"，由调用方按状态本身处理。
+            return false;
+        }
+        long age = heartbeatAgeMs(key);
+        return age < 0 || age <= HEARTBEAT_TIMEOUT_MS;
     }
 }
 // 新增结束

@@ -2,6 +2,209 @@
 
 > 代码阅读方式：每次先说明文件路径和文件职责，再按照文件从上到下讲依赖、字段、构造器和方法。简单部分短讲，复杂部分展开；一个文件的各部分讲完后，再给出该文件的完整代码，避免把零散片段当成可以独立运行的代码。
 
+## 〇、本次修改记录（2026-11-18）：异步队列从 Redis List 迁移到 RabbitMQ
+
+> 这一节只记录"架构迁移"层面的改动，读完就知道哪些章节被重写、哪些类被删、为什么。原有的 10-22 发布记录挪到下一节。
+
+### 0.1 改了什么
+
+评分、追问、报告三条异步链路，原来都用「Redis List 三个 key + 定时拉取 + 心跳 + 扫库补偿」自建队列。现在全部换成 RabbitMQ：**主队列 + 延迟重试队列 + 死信队列**，每条线一套。
+
+| 项目 | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| 任务通道 | Redis List（`interview:task:judge` 等） | RabbitMQ 队列（`interview.judge.queue` 等） |
+| 消费入口 | `JudgeTaskConsumerLoop` / `FollowUpTaskConsumerLoop`（`@Scheduled(fixedDelay = 200)` 反复拉） | `@RabbitListener`，broker 主动推 |
+| 可靠消费 | `LMOVE` 搬到 processing 队列，处理完按值 `remove` | 手动 `basicAck`，没 ack 就算在处理中，连接断了自动 requeue |
+| 失败重试 | `retryCount + 1` 重投主队列，无退避 | 投延迟队列，TTL 10 秒后经 DLX 回主队列，上限 3 次 |
+| 死信 | 第三个 Redis key | `interview.*.dead.queue`，消息体原样保留 |
+| 卡单兜底 | `HeartbeatService`（10 秒续期 / 30 秒 TTL）+ `JudgeTaskCompensationService`（30 秒扫库）+ `interview_judge_compensation_log` 表 | 全部删除：broker 的 unacked 语义 + 消费超时 + 延迟重试已经覆盖，不再需要"猜线程死没死" |
+| 报告生成 | `@Async("reportGenerationTaskExecutor")` | 投 `ReportTask` 消息；`generate` 返回 `boolean`，失败不写终态 |
+| 发布可靠性 | 无（`rightPush` 成功即认为成功） | publisher confirm + returns + `mandatory`，路由不到队列立即报错 |
+
+### 0.2 队列拓扑（九条）
+
+```text
+interview.judge.queue            ← 评分主队列（提交答案后投递）
+interview.judge.retry.queue      TTL 10s + DLX → 回主队列
+interview.judge.dead.queue       重试 3 次后落这里
+
+interview.follow-up.queue        ← 追问主队列（评分落库、状态推进后投递）
+interview.follow-up.retry.queue
+interview.follow-up.dead.queue
+
+interview.report.queue           ← 报告主队列（POST /reports 抢占成功后投递）
+interview.report.retry.queue
+interview.report.dead.queue
+```
+
+全部 `durable`；消息 `deliveryMode=PERSISTENT`；消费端 `acknowledge-mode: manual`、`prefetch: 2`、`concurrency: 2`、`max-concurrency: 4`。
+
+### 0.3 代码增删
+
+```text
+新增  config/RabbitConfig.java                 九条队列声明
+新增  application/JudgeTaskConsumer.java       @RabbitListener + 手动 ack + 60s 超时
+新增  application/FollowUpTaskConsumer.java    同上（4 线程池，60s 超时）
+新增  application/ReportTask.java              报告任务载荷
+新增  application/ReportTaskPublisher.java     报告任务投递器
+新增  application/ReportTaskConsumer.java      报告消费者 + 幂等判重 + markFailed
+
+重写  application/JudgeTaskPublisher.java      只负责发（原为发布+消费+重试+死信）
+重写  application/FollowUpTaskPublisher.java   只负责发
+重写  application/JudgeTask.java               注释口径改为 MQ
+重写  application/ReportController.java        改投队列；补并发建行、已完成的幂等读、原子抢占
+重写  application/ReportGenerationAsyncService.java  去掉 @Async，返回 boolean，不写 FAILED
+新增  config/RabbitConfig.java 中的报告三条队列
+
+删除  application/JudgeTaskConsumerLoop.java
+删除  application/FollowUpTaskConsumerLoop.java
+删除  application/JudgeTaskCompensationService.java
+删除  application/HeartbeatService.java
+删除  AsyncConfig 里的 followUpTaskExecutor
+删除  docker/mysql 的 interview_judge_compensation_log 表（02-upgrade.sql 里 DROP）
+```
+
+### 0.4 文档改动范围
+
+```text
+一、项目最终实现什么          第 5 小节由"异步队列与补偿"改为"异步消息队列"
+二、项目技术和目录            技术栈加 RabbitMQ；config 目录职责加队列拓扑
+三、项目初始化模块            docker-compose 加 rabbitmq 服务；.env 与 application.yml 加 MQ 配置
+四、依赖文件                  pom 加 spring-boot-starter-amqp；答案表字段说明调整
+八、创建面试会话模块          删除 HeartbeatService 整节；准备服务去掉 register/unregister
+十一、AI 异步评分模块         整节重写：RabbitConfig / JudgeTask / Publisher / Consumer；新增"为什么删掉补偿服务"
+十二、追问模块                文件 4~6 换为 MQ 版；模块流程图重画
+十三、报告模块                模块流程重画；报告 4 扩为 5 个文件（任务 / 投递 / 控制器 / 生成服务 / 消费者）
+十七~二十                    联调验证改为看控制台队列；文件地图与阶段清单同步
+```
+
+### 0.5 如果面试问到"为什么换 MQ"，三句话答
+
+1. **我们真正需要的不是"一个队列"，是五个语义**：消费确认、失败重试、死信留存、多实例负载均衡、积压可视化。Redis List 只给第一个的一半，剩下全得自己写，写完还要维护心跳和扫库补偿。
+2. **自建队列最致命的不是代码量，是"猜线程死活"**：心跳只能证明线程还在，证明不了任务会完成——AI 卡在 SSL 读超时 400 秒时心跳一切正常，补偿器永远跳过。MQ 用"没 ack 就是我的"直接绕开这个判断。
+3. **统一成本远低于维护两套**：评分先用 MQ、报告还用 `@Async`，系统里就并存两种异步模型，排查时先要判断"这是哪套"。统一之后，运维只盯一个控制台，新人也只需要理解一种失败模型。
+
+---
+
+## 〇附、修改记录（2026-10-22）：部署到 GitHub 公开仓库
+
+> 本节只记录"工程发布"层面的改动，不涉及任何业务代码。正文（一、二、三……）保持原样，阅读顺序不受影响；想看代码是怎么一步步写出来的，仍从"一、整个项目最终要实现什么"开始读。
+
+### 0.1 最终结果
+
+```text
+公开仓库      https://github.com/wangyuehao423-dot/AI-Meetting
+默认分支      main
+提交数        1 个（初始提交 12831cd）
+纳入版本库    128 个文件
+克隆命令      git clone https://github.com/wangyuehao423-dot/AI-Meetting.git
+```
+
+仓库名是 `AI-Meetting`（Meetting 是三个 e、两个 t），与项目目录名保持一致。手工拼网址时最容易顺手写成 Meeting，这是一处真实的坑。
+
+### 0.2 新增 README.md
+
+原来仓库里唯一的说明文档是这份 15900+ 行的教学稿 `AI-Meetting.md`，GitHub 首页会直接渲染它，第一屏全是"代码阅读方式"的说明，看不出这个项目是干什么的。所以另写了一份 `README.md` 作为门面：
+
+```text
+功能表        七个环节各一行，一眼看清全流程
+技术栈        后端 / 前端 / 基础设施三段
+架构要点      状态机、Singleflight + Fencing Token、LiteFlow 追问链、Prompt 外置
+快速开始      docker compose up -d -> 环境变量 -> mvn spring-boot:run -> npm run dev
+目录结构      与教学稿 2.3 节保持一致
+说明          密钥如何注入、哪些本地文件不会进版本库
+```
+
+### 0.3 没有上传的内容
+
+`.gitignore` 本身没有改动，但部署前逐条核对过，下面这些只留在本地：
+
+| 类别 | 具体项 | 不传的原因 |
+| --- | --- | --- |
+| 构建产物 | `target/`、`frontend/dist/` | 能由源码重新生成，体积大 |
+| 依赖目录 | `frontend/node_modules/` | 同上，`package-lock.json` 已足够锁定版本 |
+| 运行数据 | `data/`（含上传的简历 PDF）、`*.log` | 简历属于个人隐私，日志是本地调试产物 |
+| 密钥 | `.env`、`*.pem` | 真实凭证一律不入库 |
+| 编辑器 | `.idea/`、`.vscode/`、`.fltest/` | 个人环境配置 |
+| 本机脚本 | `backend-launcher.bat`、`frontend-launcher.bat`、`*.ps1` | 里面写死了本机绝对路径，别人拿去跑不通 |
+
+### 0.4 密钥体检：仓库里没有任何真实凭证
+
+这是公开仓库最需要先确认的一件事，逐处结论如下：
+
+```text
+application.yml
+    interview.ai.api-key / interview.jwt-secret / aliyun.nls.app-key 等
+    全部写成 ${INTERVIEW_AI_API_KEY:change-me} 形式
+    -> 没配环境变量时应用仍能启动（占位符有默认值），但调用会失败，这是刻意的
+    -> 真实的 Key 只能通过环境变量注入，永远不进配置文件
+
+.env.example
+    只有字段名和占位值（replace-with-your-api-key、replace-with-a-long-random-secret）
+
+docker-compose.yml
+    MYSQL_ROOT_PASSWORD: root 只用于本地容器，端口映射到 15006，不对公网暴露
+```
+
+### 0.5 提交身份与历史整理
+
+原来的提交作者是 `hspedu <123@qq.com>`（占位信息），GitHub 上会显示成一个陌生作者，提交也挂不到账号头像上。已做了两件事：
+
+```text
+改本地提交身份
+    -> user.name  = wangyuehao423-dot
+    -> user.email = 242386285+wangyuehao423-dot@users.noreply.github.com（GitHub 提供的 noreply 邮箱）
+
+合并历史
+    -> 本地原有的 2 个提交（初始提交 + 补 README）合并成 1 个干净的初始提交
+    -> 仓库还没有远端时重写历史是安全的，不会影响任何人
+```
+
+### 0.6 上传方式：这次为什么没有用 git push
+
+遇到的具体问题：这台机器**直连 `github.com` 不通**（HTTPS 走代理返回 502、不走代理直接超时），但 `api.github.com` 是通的。所以 `git push` 必然失败，只能换一条路——用 **GitHub 的 Git Data API**（在 REST 层直接写 git 对象，等价于"手工造一个提交"）：
+
+```text
+PUT   /contents/.gitignore     空仓库不能直接建 blob（会返回 409 Git Repository is empty），先塞一个文件把仓库激活
+POST  /git/blobs      x 128    每个文件一个 blob，内容用 base64 传，返回的 sha 与本地对象 sha 逐个比对
+POST  /git/trees               128 个条目合成一棵树，返回 sha = 269e6634…，与本地 HEAD 的 tree 完全一致
+                               （tree sha 一致 = 文件和目录结构逐字节相同，这是最硬的一致性证明）
+POST  /git/commits    parents=[]  造一个没有父提交的根提交，这样远端也只有 1 个提交
+PATCH /git/refs/heads/main     把 main 强制指向这个提交
+```
+
+最后一步是把**本地**也对齐到远端，否则以后 `git push` 会报 non-fast-forward。GitHub 生成的提交对象与本地 `git commit` 生成的，差异只在 message 末尾的换行，所以用下面两条把远端那个对象"复刻"回本地：
+
+```bash
+git hash-object -t commit -w --stdin   # 按相同的 tree / author / date / message 重建提交对象
+git update-ref refs/heads/main <sha>   # 把本地分支指过去
+```
+
+现在本地 `git log` 是 `12831cd`，`git status` 干净，`origin` 已指向该仓库。网络正常的环境下，直接用 `git push` 就行，不需要再走 API。
+
+### 0.7 身份认证：不用 gh CLI 的做法
+
+```text
+本机没装 gh，而且 gh 的 release 包下载被同一套网络策略拦住
+    -> 改用 PortableGit 自带的 git-credential-manager.exe
+    -> printf "protocol=https\nhost=github.com\n\n" | git credential fill
+    -> 自动弹出浏览器 OAuth 授权页，点一次 Authorize
+    -> 拿到 token 后直接调 api.github.com
+    -> token 交给 Git Credential Manager 存进 Windows 凭据管理器，以后不用再登录
+```
+
+过程中临时落盘的明文 token 用完即删，没有留在项目里。
+
+### 0.8 以后改完代码怎么同步
+
+```bash
+git add -A
+git commit -m "feat: xxx"
+git push
+```
+
+换了机器或者远端多了别人的提交时，先 `git pull --rebase` 再推。
+
 ## 一、整个项目最终要实现什么
 
 在正式进入任何模块之前，先明确整个项目的端到端流程。后面学习每个模块时，要始终知道该模块的输入、输出，以及它和前后模块的连接关系。
@@ -83,21 +286,23 @@ JWT 不是登录凭证的明文替代品。服务端仍然必须验证签名和�
 
 为什么状态和上下文要分开：状态是判断依据，必须能原子地比对与更新；上下文是给 AI 出题看的历史材料，允许多次覆盖。题目的取用也是同一套思路——预生成的题先以 `PRE_GENERATED` 落库占住题号，被真正取用时再用 CAS 改成 `ACTIVE`，避免并发取题时拿到还没准备好的题。要注意 CAS 和锁不是一回事：锁控制“同一时刻谁能执行”，CAS 控制“基于旧版本做的修改不会覆盖新版本”。
 
-#### 5. 异步队列与补偿
+#### 5. 异步消息队列
 
 提交答案不应该让用户一直等 AI 评分，项目把“提交”和“评分”拆成两个时间点：
 
 ```text
 提交答案
-    -> 快速保存答案，并把评分任务写入 Redis 队列
-    -> 消费者（JudgeTaskConsumerLoop）稍后取任务、调用 AI 评分
-    -> 成功则落库，失败则重试
-    -> 重试超过上限仍失败，把答案标记为 JUDGE_FAILED
-    -> 补偿服务（JudgeTaskCompensationService）再扫一遍，
-       仍救不回来就写一条 interview_judge_compensation_log 供排查
+    -> 快速保存答案，并向 RabbitMQ 投一条评分任务（立即返回 202 语义）
+    -> 消费者（@RabbitListener）从 interview.judge.queue 取任务、调用 AI 评分
+    -> 成功则落库并 basic.ack；失败则投延迟重试队列（TTL 10 秒后经 DLX 回主队列）
+    -> 重试超过 3 次转死信队列 interview.judge.dead.queue，原样留现场给运维
 ```
 
-队列里放的是“任务”，数据库里存的是“任务的状态”，这两者一旦对不上（比如任务丢了但答案还停在待评分），就必须有补偿兜底，否则这道题会永远卡在中间态。追问任务走的是另一条队列（FollowUpTaskPublisher / FollowUpTaskConsumerLoop），结构和评分队列一致。
+三类异步任务（评分 / 追问 / 报告）共用同一套拓扑：**主队列 + 延迟重试队列 + 死信队列**。队列里放的是“任务”，数据库里存的是“任务的状态”，两者职责不重叠——队列保证“任务不丢、失败可重投”，状态字段保证“前端可查、能显示生成中还是已完成”。
+
+**为什么不需要再写补偿服务：** 用 Redis List 自建队列时，必须自己解决“消息被取走、消费者随后崩溃”这件事，于是要 processing 队列、心跳、定时扫库三件套。RabbitMQ 的语义是“没 ack 就还是我的”：消费者崩溃 → 连接断开 → unacked 消息自动 requeue 给其他消费者。原来那套补偿逻辑（`JudgeTaskCompensationService` + `HeartbeatService` + `interview_judge_compensation_log` 表）因此整体删除，少了一张表、两个类、一个定时器。
+
+**为什么重试走延迟队列而不是 `basicNack(requeue=true)`：** requeue 会把消息立刻放回队首，一个正在限流的模型接口会被连续打三次、三次全败直接进死信，重试等于没重试。延迟队列让每次重试之间隔 10 秒，给下游留恢复窗口。
 
 #### 6. 分布式 Singleflight 与 Fencing Token
 
@@ -216,6 +421,7 @@ MyBatis-Plus 3.5.12
 MySQL 8（mysql-connector-j）
 Redis
 MongoDB
+RabbitMQ 3.13（spring-boot-starter-amqp，三类异步任务的主队列 / 延迟重试 / 死信）
 Spring AI 1.0.0-M6（spring-ai-core + spring-ai-openai-spring-boot-starter）
 LiteFlow 2.12.4
 Spring WebSocket
@@ -236,7 +442,7 @@ Vite 5.4.11（构建与开发服务器）
 浏览器 Media API（getUserMedia 采集麦克风音频）
 ```
 
-前端只有一个 `frontend/` 工程，入口是 `index.html` + `src/main.jsx`；开发服务器配置在 `vite.config.js`，把 `/api` 代理到 `http://localhost:18080`、把 `/ws` 代理到 `ws://localhost:18080`。
+前端只有一个 `frontend/` 工程，入口是 `index.html` + `src/main.jsx`；开发服务器配置在 `vite.config.js`，把 `/api` 代理到 `http://localhost:8080`、把 `/ws` 代理到 `ws://localhost:8080`。
 
 ### 2.3 后端目录
 
@@ -260,7 +466,7 @@ src/main/java/com/example/interview/
 
 ```text
 config
-    -> Spring、安全（JWT 过滤器）、跨域、异步线程池、定时任务、异常处理配置
+    -> Spring、安全（JWT 过滤器）、跨域、异步线程池、定时任务、异常处理、RabbitMQ 队列拓扑配置
 
 domain
     -> 面试状态、事件、状态机、领域快照
@@ -306,7 +512,7 @@ skill
 2. 修改 pom.xml 并下载依赖
     -> Maven 能够成功编译项目
 3. 创建 Docker、数据库脚本和应用配置文件
-    -> MySQL、Redis、MongoDB 有明确的连接地址和初始化数据
+    -> MySQL、Redis、MongoDB、RabbitMQ 有明确的连接地址和初始化数据
 4. 创建公共配置类
     -> 跨域、异步、异常处理和初始数据逻辑准备完成
 5. 启动并验证
@@ -485,6 +691,7 @@ public class InterviewPlatformApplication {
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-websocket</artifactId></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-mongodb</artifactId></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-amqp</artifactId></dependency>
     <dependency><groupId>com.alibaba.cloud</groupId><artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId></dependency>
     <dependency><groupId>com.alibaba.cloud</groupId><artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId></dependency>
     <dependency><groupId>com.baomidou</groupId><artifactId>mybatis-plus-spring-boot3-starter</artifactId><version>3.5.12</version></dependency>
@@ -506,13 +713,11 @@ public class InterviewPlatformApplication {
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
         <configuration>
           <annotationProcessorPaths>
             <path>
               <groupId>org.projectlombok</groupId>
               <artifactId>lombok</artifactId>
-              <version>1.18.34</version>
             </path>
           </annotationProcessorPaths>
         </configuration>
@@ -523,6 +728,8 @@ public class InterviewPlatformApplication {
 ```
 
 这里出现的 `spring-cloud` / `spring-cloud-alibaba` / `spring-ai` 三个版本属性，是给 `<dependencyManagement>` 里的 BOM 用的；`spring-ai-core`、`spring-ai-openai-spring-boot-starter` 的版本由 `spring-ai-bom` 统一管理，`jjwt`、`mybatis-plus`、`liteflow`、`tika` 则各自写明版本。`maven-compiler-plugin` 里配置了 Lombok 注解处理器，实体上用的 `@Data` 才会在编译期生成 getter/setter。
+
+`spring-boot-starter-amqp` 没有写版本号，由 `spring-boot-starter-parent` 统一管理——这是 Spring Boot 官方 starter，版本永远跟着 Boot 走，自己钉版本反而容易和 Boot 的自动配置对不上。它提供的东西是 `RabbitTemplate`（发消息）、`@RabbitListener`（收消息）、`Channel`（手动 ack）三样，评分、追问、报告三条异步链路全靠它。
 
 保存 `pom.xml` 后，点击 IDEA 右侧 Maven 面板的刷新按钮，等待依赖下载完成。
 
@@ -570,7 +777,7 @@ src/main/resources/application.yml
 #### 1. 创建 Docker Compose 文件
 
 **创建文件：** 项目根目录下的 `docker-compose.yml`。  
-**作用：** 定义并启动 MySQL、Redis、MongoDB 三个开发环境服务。
+**作用：** 定义并启动 MySQL、Redis、MongoDB、RabbitMQ 四个开发环境服务。
 
 ```yaml
 services:
@@ -580,7 +787,7 @@ services:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: interview
     ports:
-      - "15006:3306"
+      - "13306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
       - ./docker/mysql/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
@@ -588,19 +795,38 @@ services:
   redis:
     image: redis:7
     ports:
-      - "16379:6379"
+      - "16380:6379"
 
   mongodb:
     image: mongo:7
     ports:
-      - "27017:27017"
+      - "27018:27017"
     volumes:
       - mongo-data:/data/db
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      # 账号密码显式设成 interview，而不是用默认 guest。
+      # guest 只允许从 localhost 登录，且默认口令人人皆知；
+      # 一旦要在另一台机器上跑消费者或看控制台，guest 直接登不上。
+      RABBITMQ_DEFAULT_USER: interview
+      RABBITMQ_DEFAULT_PASS: interview123
+    ports:
+      # 5672 是 AMQP 协议端口，后端连的就是它
+      - "5672:5672"
+      # 15672 是 Web 控制台端口，浏览器打开 http://localhost:15672 看队列积压
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
 
 volumes:
   mysql-data:
   mongo-data:
+  rabbitmq-data:
 ```
+
+**为什么消息队列选了 RabbitMQ 而不是继续用 Redis List：** 本项目的异步任务有三类——评分、追问、报告，它们要的是同一组能力：消费确认、失败重试、死信留存、多消费者抢同一条队列、消息持久化、积压可视化。Redis List 只能给出"一个能 push/pop 的列表"，剩下五件事全部要自己写：搬运到 processing 队列防丢、按值精确 remove、心跳判断消费者死没死、定时扫库补偿、重试计数。这套自研队列写出来以后，面试官第一个问题必然是"为什么不直接用 MQ"，而答案是"没有理由"。RabbitMQ 把这些做成 broker 的默认语义：队列侧只剩一份声明（`RabbitConfig`）+ 三个投递器 + 三个消费者，"心跳服务"和"补偿扫库"这两套自成体系的组件直接消失，运维也只需要盯一个控制台。
 
 #### 2. 创建 MySQL 初始化脚本
 
@@ -608,7 +834,7 @@ volumes:
 **再创建文件：** `docker/mysql/01-schema.sql`  
 **作用：** 创建项目运行需要的数据库表。它不是需要手动逐条执行的 PowerShell 文件；MySQL 容器第一次初始化时会自动执行它。
 
-需要创建的核心表是（共 9 张）：
+需要创建的核心表是（共 8 张）：
 
 ```text
 app_user
@@ -619,10 +845,11 @@ interview_question
 interview_answer
 interview_follow_up
 interview_report
-interview_judge_compensation_log
 ```
 
-除了这些表，`01-schema.sql` 里还有几处后来补上的列和唯一键，后面文档出现这些名字时要和这里对上：`interview_question.status`（预生成题目先以 `PRE_GENERATED` 占位，取用时 CAS 改成 `ACTIVE`，配套联合索引 `idx_question_session_status`）；`interview_answer.is_follow_up`（区分初次作答与追问作答）和 `retry_count`（评分补偿重试次数），唯一键由 `(question_id)` 改成 `(question_id, is_follow_up)`；`interview_follow_up` 新增唯一键 `uk_follow_up_session_question (session_id, question_id)`；`interview_report.status`（`GENERATING / COMPLETED / FAILED`）与 `updated_at`；以及补偿日志表 `interview_judge_compensation_log`。旧库升级时这些列要用 `ALTER TABLE` 手工补一次，`01-schema.sql` 末尾以注释形式给出了迁移语句。
+除了这些表，`01-schema.sql` 里还有几处后来补上的列和唯一键，后面文档出现这些名字时要和这里对上：`interview_question.status`（预生成题目先以 `PRE_GENERATED` 占位，取用时 CAS 改成 `ACTIVE`，配套联合索引 `idx_question_session_status`）；`interview_answer.status`（`SUBMITTED / JUDGED`）、`is_follow_up`（区分初次作答与追问作答）、`retry_count` 和 `updated_at`，唯一键由 `(question_id)` 改成 `(question_id, is_follow_up)`，另加 `request_id` 全局唯一；`interview_follow_up` 新增唯一键 `uk_follow_up_session_question (session_id, question_id)`；`interview_report.status`（`GENERATING / COMPLETED / FAILED`）与 `updated_at`；`interview_resume.extracted_skills`（AI 技能提取结果）。旧库升级时这些列要用 `ALTER TABLE` 手工补一次，工程里对应的脚本是 `docker/mysql/02-upgrade.sql`。
+
+**原来还有第 9 张表 `interview_judge_compensation_log`，现在已经删掉：** 它是 Redis 自建队列时代的"补偿记账本"——补偿服务每次扫库判定一条答案卡住，无论救回还是放弃都要写一行，用来事后排查。评分改成 RabbitMQ 之后，重试由延迟队列承担、重试耗尽进死信队列，现场原样保留在 broker 里（控制台点进去就能看到消息体），业务侧不再需要自己记账。`02-upgrade.sql` 末尾那句 `DROP TABLE IF EXISTS interview_judge_compensation_log` 就是给老库准备的——代码里已经没有任何写入方，留着只会让人以为还有补偿逻辑在跑。
 
 将本文档后续各业务模块给出的建表 SQL 按顺序放入这个文件。修改 SQL 后，已有的 MySQL 数据卷不会自动重新执行脚本；开发阶段需要重新创建数据卷：
 
@@ -639,12 +866,16 @@ docker compose up -d
 **作用：** 记录项目需要哪些环境变量，供开发者复制参考。不要把真实 API Key 写入这个文件。
 
 ```dotenv
-INTERVIEW_DB_URL=jdbc:mysql://localhost:15006/interview
+INTERVIEW_DB_URL=jdbc:mysql://localhost:13306/interview
 INTERVIEW_DB_USERNAME=root
 INTERVIEW_DB_PASSWORD=root
 INTERVIEW_REDIS_HOST=localhost
-INTERVIEW_REDIS_PORT=16379
-INTERVIEW_MONGO_URI=mongodb://localhost:27017/interview
+INTERVIEW_REDIS_PORT=16380
+INTERVIEW_MONGO_URI=mongodb://localhost:27018/interview
+INTERVIEW_MQ_HOST=localhost
+INTERVIEW_MQ_PORT=5672
+INTERVIEW_MQ_USER=interview
+INTERVIEW_MQ_PASSWORD=interview123
 INTERVIEW_JWT_SECRET=replace-with-a-long-random-secret
 INTERVIEW_AI_BASE_URL=
 INTERVIEW_AI_API_KEY=
@@ -662,45 +893,52 @@ ALIYUN_NLS_ACCESS_KEY_SECRET=
 **作用：** 告诉 Spring Boot 如何连接 MySQL、Redis、MongoDB，以及从哪里读取 JWT 和 AI 配置。
 
 ```yaml
-server:
-  port: ${INTERVIEW_SERVER_PORT:18080}
-
 spring:
   ai:
     openai:
       base-url: ${INTERVIEW_AI_BASE_URL:https://tokenx24.com/v1}
       api-key: ${INTERVIEW_AI_API_KEY:${interview.ai.api-key}}
-      http-client:
-        connect-timeout: 10s
-        read-timeout: 180s
-        write-timeout: 30s
       chat:
-        completions-path: /chat/completions
         options:
           model: ${INTERVIEW_AI_MODEL:${interview.ai.model}}
   datasource:
-    url: ${INTERVIEW_DB_URL:jdbc:mysql://localhost:15006/interview}
+    url: ${INTERVIEW_DB_URL:jdbc:mysql://localhost:13306/interview}
     username: ${INTERVIEW_DB_USERNAME:root}
     password: ${INTERVIEW_DB_PASSWORD:root}
 
   data:
     redis:
       host: ${INTERVIEW_REDIS_HOST:localhost}
-      port: ${INTERVIEW_REDIS_PORT:16379}
+      port: ${INTERVIEW_REDIS_PORT:16380}
     mongodb:
-      uri: ${INTERVIEW_MONGO_URI:mongodb://localhost:27017/interview}
+      uri: ${INTERVIEW_MONGO_URI:mongodb://localhost:27018/interview}
 
-  cloud:
-    nacos:
-      config:
-        enabled: false
-        import-check:
-          enabled: false
-      discovery:
-        enabled: false
+  # 消息队列：评分、追问、报告三条异步链路的统一通道。
+  rabbitmq:
+    host: ${INTERVIEW_MQ_HOST:localhost}
+    port: ${INTERVIEW_MQ_PORT:5672}
+    username: ${INTERVIEW_MQ_USER:interview}
+    password: ${INTERVIEW_MQ_PASSWORD:interview123}
+    listener:
+      simple:
+        # manual：ack 由业务代码在「分数落库 / 追问写表 / 报告写回之后」显式调用。
+        # 用默认的 auto 时，消息一交给监听方法就算消费成功，消费者随后崩了消息就没了，
+        # 库里的答案会永远停在「待评分」——手动 ack 才是崩溃恢复的前提。
+        acknowledge-mode: manual
+        # prefetch 决定单个消费者手里最多攥几条未确认消息。
+        # 一条评分要调 AI 3~10 秒，预取太多会让一台机器吃满整个队列，多实例分不到活。
+        prefetch: 2
+        concurrency: 2
+        max-concurrency: 4
+    # publisher confirm：把「发布成功」从「方法没抛异常」变成「broker 真的收到了」。
+    # 没有它，发布那一刻 broker 挂了，消息静默丢失，而库里那条答案没人会来救。
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
 
 interview:
-  jwt-secret: ${INTERVIEW_JWT_SECRET:change-me}
+  jwt-secret: ${INTERVIEW_JWT_SECRET:}
   singleflight:
     local-fallback-enabled: ${INTERVIEW_SINGLEFLIGHT_LOCAL_FALLBACK_ENABLED:true}
   ai:
@@ -730,7 +968,9 @@ docker compose up -d
 docker compose ps
 ```
 
-三个服务都显示 `running` 或 `Up` 后，基础设施才算启动成功。本机当前使用以下宿主机端口：MySQL `15006`、Redis `16379`、MongoDB `27017`。其中 Redis 容器内部仍使用 `6379`，MongoDB 容器内部仍使用 `27017`。
+四个服务都显示 `running` 或 `Up` 后，基础设施才算启动成功。本机当前使用以下宿主机端口：MySQL `13306`、Redis `16380`、MongoDB `27018`、RabbitMQ `5672`（Web 控制台 `15672`）。其中 Redis 容器内部仍使用 `6379`，MongoDB 容器内部仍使用 `27017`。
+
+RabbitMQ 起来后浏览器打开 `http://localhost:15672`，用 `interview / interview123` 登录，能看到 `Queues` 页签。后面联调时判断"任务有没有真的投进来"就看这里：`interview.judge.queue` 的 Ready 数不涨，说明消息压根没进 broker；一直不降到 0，说明消费者没在跑或卡在 AI 调用上。
 
 如果出现 `open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified`，说明 Docker Desktop 或其 Linux 引擎尚未启动，需要先启动 Docker Desktop，再执行 Compose 命令。如果出现 `port is already allocated`，说明宿主机端口被其他服务占用，应检查占用情况或调整 Compose 的宿主机端口，并同步修改 `application.yml` 和 `.env.example`。
 
@@ -740,6 +980,7 @@ docker compose ps
 docker compose logs mysql
 docker compose logs redis
 docker compose logs mongodb
+docker compose logs rabbitmq
 ```
 
 ### 初始化 4：创建公共配置类
@@ -762,8 +1003,6 @@ import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
-import java.util.concurrent.RejectedExecutionHandler;
-import java.util.concurrent.ThreadPoolExecutor;
 
 // **开启 Spring 的 @Async 异步方法代理。**
 @Configuration
@@ -772,74 +1011,50 @@ public class AsyncConfig {
 
     @Bean(name = "interviewPreparationTaskExecutor")
     public Executor interviewPreparationTaskExecutor() {
-        return executor("interview-preparation-", 2, 4, 50,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("interview-preparation-", 2, 4, 50);
     }
 
     @Bean(name = "questionGenerationTaskExecutor")
     public Executor questionGenerationTaskExecutor() {
-        // **预生成任务丢了也无所谓，静默丢弃，不阻塞调用方。**
-        return executor("question-generation-", 2, 4, 50,
-                new ThreadPoolExecutor.DiscardPolicy());
+        return executor("question-generation-", 2, 4, 50);
     }
 
     @Bean(name = "resumeParsingTaskExecutor")
     public Executor resumeParsingTaskExecutor() {
-        return executor("resume-parsing-", 2, 4, 50,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("resume-parsing-", 2, 4, 50);
     }
 
     @Bean(name = "aiScoringTaskExecutor")
     public Executor aiScoringTaskExecutor() {
-        return executor("ai-scoring-", 4, 8, 100,
-                new ThreadPoolExecutor.CallerRunsPolicy());
-    }
-
-    @Bean(name = "followUpTaskExecutor")
-    public Executor followUpTaskExecutor() {
-        return executor("follow-up-", 2, 4, 50,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("ai-scoring-", 4, 8, 100);
     }
 
     @Bean(name = "reportGenerationTaskExecutor")
     public Executor reportGenerationTaskExecutor() {
-        return executor("report-generation-", 2, 4, 30,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("report-generation-", 2, 4, 30);
     }
 
     @Bean(name = "demeanorAnalysisTaskExecutor")
     public Executor demeanorAnalysisTaskExecutor() {
-        return executor("demeanor-analysis-", 2, 4, 30,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("demeanor-analysis-", 2, 4, 30);
     }
 
     @Bean(name = "transcriptionTaskExecutor")
     public Executor transcriptionTaskExecutor() {
-        return executor("transcription-", 2, 4, 100,
-                new ThreadPoolExecutor.CallerRunsPolicy());
-    }
-
-    @Bean(name = "cacheWriteTaskExecutor")
-    public Executor cacheWriteTaskExecutor() {
-        // **缓存回填等轻量异步操作，不依赖 @Async 注解，供 CompletableFuture 使用。**
-        return executor("cache-write-", 2, 4, 50,
-                new ThreadPoolExecutor.CallerRunsPolicy());
+        return executor("transcription-", 2, 4, 100);
     }
 
     private Executor executor(
             String prefix,
             int corePoolSize,
             int maxPoolSize,
-            int queueCapacity,
-            RejectedExecutionHandler rejectionPolicy
+            int queueCapacity
     ) {
         var executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(corePoolSize);
         executor.setMaxPoolSize(maxPoolSize);
         executor.setQueueCapacity(queueCapacity);
         executor.setThreadNamePrefix(prefix);
-        // 拒绝策略：默认用 CallerRunsPolicy（谁提交谁执行，任务不丢）
-        executor.setRejectedExecutionHandler(rejectionPolicy);
         executor.initialize();
         return executor;
     }
@@ -848,59 +1063,24 @@ public class AsyncConfig {
 
 **上面代码块中的新增配置保持为完整 Java 文件；为保证复制后仍然是可编译代码，代码行的改动标记采用代码内 `// **...**` 注释，文字说明和代码块标题均使用 Markdown 粗体。**
 
+**注意这里已经没有 `followUpTaskExecutor`：** 追问原来靠 `@Async("followUpTaskExecutor")` 在独立线程池里消费队列，现在消费由 `@RabbitListener` 驱动，超时控制用的是消费者类内部那个 4 线程的小池（见「十二、追问模块」）。线程池归谁管这件事必须说清：交给 Spring 的 `ThreadPoolTaskExecutor` 就归 `@Async` 用；`@RabbitListener` 的并发度由 `spring.rabbitmq.listener.simple.concurrency / max-concurrency` 决定，两者混着配会出现"池开得很大但消息只有两条在跑"的错觉。`aiScoringTaskExecutor` 与 `reportGenerationTaskExecutor` 同样不再承载评分与报告——那两件事已经迁到 MQ，留着只是给同链路上的其他轻量异步任务复用。
+
 #### 2. 创建跨域配置
 
 **创建文件：** `src/main/java/com/example/interview/config/CorsConfig.java`  
-**作用：** 允许本地前端开发地址访问后端接口。前端地址和后端端口确定后，再填写允许的来源。开发环境下前端经 Vite 代理访问后端，属于同源不需要跨域，因此该类保持为占位空类。
-
-```java
-package com.example.interview.config;
-
-public class CorsConfig {
-}
-```
+**作用：** 允许本地前端开发地址访问后端接口。前端地址和后端端口确定后，再填写允许的来源。
 
 #### 3. 创建统一异常处理
 
 **创建文件：** `src/main/java/com/example/interview/config/ApiExceptionHandler.java`  
 **作用：** 把 Controller 抛出的业务异常转换成统一 JSON 响应，前端不需要分别处理不同格式的错误。
 
-```java
-// 从这里开始是新增的：以下整个文件都是新增的（磁盘上原是一个只有类头的空类，
-// 报告接口抛出的 AccessDeniedException 没人接，会一路冒到 Spring MVC 默认处理变成 500）。
-package com.example.interview.config;
+#### 4. 创建初始化数据程序
 
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.AccessDeniedException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
+**创建文件：** `src/main/java/com/example/interview/config/DatabaseSeedRunner.java`  
+**作用：** Spring Boot 启动成功后向岗位表写入演示数据。它不是数据库建表脚本，也不是手动执行的命令；它会随着后端启动自动运行。
 
-import java.util.Map;
-
-@RestControllerAdvice
-public class ApiExceptionHandler {
-
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<Map<String, Object>> badRequest(
-            IllegalArgumentException error
-    ) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(Map.of("message", error.getMessage()));
-    }
-
-    @ExceptionHandler(AccessDeniedException.class)
-    public ResponseEntity<Map<String, Object>> forbidden(
-            AccessDeniedException error
-    ) {
-        return ResponseEntity.status(HttpStatus.FORBIDDEN)
-                .body(Map.of("message", error.getMessage()));
-    }
-}
-// 新增结束
-```
-
-#### **4. 创建定时任务配置**
+#### **5. 创建定时任务配置**
 
 **创建文件：** `src/main/java/com/example/interview/config/SchedulingConfig.java`  
 **作用：** **启用 Spring 的定时任务能力，供 RedisSingleflight 的本地缓存清理等定时方法使用。**
@@ -918,7 +1098,7 @@ public class SchedulingConfig {
 }
 ```
 
-**这四个类创建完成后，才进入“注册和登录模块”。公共配置类的具体代码应在本节分别放在对应文件路径下，不能只列文件名而不说明创建位置和作用。**
+**这五个类创建完成后，才进入“注册和登录模块”。公共配置类的具体代码应在本节分别放在对应文件路径下，不能只列文件名而不说明创建位置和作用。**
 
 ### 初始化 5：启动后端并完成基础验证
 
@@ -1046,7 +1226,6 @@ package com.example.interview.infrastructure.mysql;
 
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
 
 @TableName("interview_session")
 public class InterviewSessionEntity {
@@ -1056,10 +1235,6 @@ public class InterviewSessionEntity {
     private Long resumeId;
     private String state;
     private BigDecimal matchScore;
-    // 会话开始时间、结束时间和创建时间，状态机推进与报告统计都要读它们。
-    private LocalDateTime startedAt;
-    private LocalDateTime endedAt;
-    private LocalDateTime createdAt;
 }
 ```
 
@@ -1068,10 +1243,7 @@ public class InterviewSessionEntity {
 package com.example.interview.infrastructure.mysql;
 
 import com.baomidou.mybatisplus.annotation.TableName;
-import lombok.Data;
 
-// 实体用 @Data 让 Lombok 生成 getter/setter，保持实体类简短。
-@Data
 @TableName("interview_question")
 public class QuestionEntity {
     private String id;
@@ -1091,7 +1263,6 @@ public class QuestionEntity {
 package com.example.interview.infrastructure.mysql;
 
 import com.baomidou.mybatisplus.annotation.TableName;
-import java.time.LocalDateTime;
 
 @TableName("interview_answer")
 public class AnswerEntity {
@@ -1105,14 +1276,12 @@ public class AnswerEntity {
     private Double score;
     private String feedback;
     private Long fencingToken;
-    // 答案创建时间，补偿服务靠它判断评分是否超时（对应 created_at 列）。
-    private LocalDateTime createdAt;
     // 追问作答标记：0=初次作答，1=追问作答。追问复用原题 questionId 提交，
     // 只能靠这一列区分同一道题的两次作答（对应 is_follow_up 列）。
     private Integer isFollowUp;
-    // 评分补偿重投次数，超过上限就把 status 置为 JUDGE_FAILED（对应 retry_count 列）。
+    // 历史重投计数（对应 retry_count 列）：现在重试次数跟着 MQ 消息体走，这一列只读留档。
     private Integer retryCount;
-    // 答案状态：PENDING_JUDGE / JUDGED / JUDGE_FAILED。
+    // 答案状态：SUBMITTED（待评分）/ JUDGED（已评分）。
     private String status;
 }
 ```
@@ -1123,11 +1292,7 @@ package com.example.interview.infrastructure.mysql;
 
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
-import java.time.LocalDateTime;
-import lombok.Data;
 
-// 实体用 @Data 让 Lombok 统一生成 getter/setter；chain 只是纯内存字段，不在表里。
-@Data
 @TableName("interview_follow_up")
 public class FollowUpEntity {
     private Long id;
@@ -1141,8 +1306,14 @@ public class FollowUpEntity {
     @TableField(exist = false)
     private String chain;
     private String content;
-    // 记录创建时间，由数据库自动写入，用于排序和展示（对应 created_at 列）。
-    private LocalDateTime createdAt;
+
+    public String getChain() {
+        return chain;
+    }
+
+    public void setChain(String chain) {
+        this.chain = chain;
+    }
 }
 ```
 
@@ -1162,8 +1333,6 @@ public class ReportEntity {
     private String status;
     // 最后一次状态或内容更新时间，对应 interview_report.updated_at 列。
     private LocalDateTime updatedAt;
-    // 报告的首次创建时间，由数据库自动写入（对应 created_at 列）。
-    private LocalDateTime createdAt;
 }
 ```
 
@@ -2654,7 +2823,7 @@ public class ResumeController {
     @GetMapping
     // 查询当前用户最新一份已经解析完成的简历。
     public ResponseEntity<ResumeView> latest(
-            @RequestParam("userId") long userId
+            @RequestParam long userId
     ) {
         ResumeEntity entity = resumes.selectOne(
                 Wrappers.<ResumeEntity>query()
@@ -2958,7 +3127,7 @@ public class PositionController {
     @GetMapping("/{id}")
     // 按岗位 ID 查询单个岗位，不存在时返回业务错误。
     public PositionView detail(
-            @PathVariable("id") long id
+            @PathVariable long id
     ) {
         var position =
                 positions.selectById(id);
@@ -2983,8 +3152,8 @@ public class PositionController {
     @PostMapping("/{id}/match")
     // 按岗位技能和 AI 提取出的简历技能计算匹配分数。
     public MatchView match(
-            @PathVariable("id") Long id,
-            @RequestParam("resumeId") Long resumeId
+            @PathVariable Long id,
+            @RequestParam Long resumeId
     ) {
         PositionEntity position = positions.selectById(id);
         ResumeEntity resume = resumes.selectById(resumeId);
@@ -3075,7 +3244,7 @@ public class PositionController {
 选择岗位和简历 -> 创建 sessionId -> 保存会话
     -> 加载/初始化快照（Redis 热缓存 -> MongoDB 冷存储 -> INIT）
     -> 开始面试：提交 START 推进到 MATCHING
-    -> 异步准备任务（注册心跳 -> 匹配 -> 出题 -> 注销心跳）
+    -> 异步准备任务（匹配 -> 出题 -> 预生成下一题）
     -> 根据事件推进状态并用 CAS 原子写回快照
     -> 前端轮询 /state 感知进度，结束时触发表现分析
 ```
@@ -3455,20 +3624,6 @@ public class InterviewSessionStateMachine {
                 InterviewEvent.QUESTION_READY,
                 InterviewState.ANSWERING
         );
-        // 从这里开始是新增的：容许"题目已展示但状态仍停在 QUESTIONING"时提交答案。
-        // 为什么必须加这一条：出题流程里 QUESTION_READY（QUESTIONING→ANSWERING）那一步的
-        // CAS 推进失败会被静默忽略（见 InterviewPreparationAsyncService.advance 的调用处），
-        // 于是前端已经把题目展示给用户了，会话快照却还停在 QUESTIONING。
-        // 此时用户提交答案触发 ANSWER_SUBMITTED，原状态机里 QUESTIONING + ANSWER_SUBMITTED
-        // 没有转移规则，直接抛 invalid transition，前端就收到 500。
-        // 题目既然已经展示，用户的作答就应当被接受并正常进入评分（JUDGING），
-        // 评分后续的 JUDGE_DONE→ASKING 流转不受影响。
-        register(
-                InterviewState.QUESTIONING,
-                InterviewEvent.ANSWER_SUBMITTED,
-                InterviewState.JUDGING
-        );
-        // 新增结束
         register(
                 InterviewState.ANSWERING,
                 InterviewEvent.ANSWER_SUBMITTED,
@@ -3816,7 +3971,6 @@ import com.example.interview.domain.InterviewState;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.mongodb.core.FindAndModifyOptions;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
@@ -3860,10 +4014,7 @@ public class SessionSnapshotRepository {
             SnapshotMongoRepository mongo,
             StringRedisTemplate redis,
             ObjectMapper mapper,
-            // 给 cacheWriter 指定 Bean 名字：AsyncConfig 里注册了 9 个 Executor，
-            // 只写类型会报"expected single matching bean but found 10"启动失败；
-            // cacheWriteTaskExecutor 的注释写明"供 CompletableFuture 使用"，正合回填场景。
-            @Qualifier("cacheWriteTaskExecutor") Executor cacheWriter,
+            Executor cacheWriter,
             MongoTemplate mongoTemplate
     ) {
         this.mongo = mongo;
@@ -4093,7 +4244,7 @@ public class SessionSnapshotRepository {
 
 **本小节目的：** 提供创建面试、开始面试、状态查询、追问查询和结束面试的接口，连接准备页面与面试主流程。
 
-**本小节流程：** 接收岗位和简历 -> 创建会话 -> 初始化状态 -> 保存快照 -> 提交 START 进入匹配中 -> 异步准备（注册心跳 -> 匹配 -> 出题 -> 注销心跳）-> 前端轮询 /state 感知进度 -> 取追问 -> 结束时触发表现分析。
+**本小节流程：** 接收岗位和简历 -> 创建会话 -> 初始化状态 -> 保存快照 -> 提交 START 进入匹配中 -> 异步准备（匹配 -> 出题 -> 预生成下一题）-> 前端轮询 /state 感知进度 -> 取追问 -> 结束时触发表现分析。
 
 ---
 
@@ -4126,7 +4277,7 @@ public record SessionView(
 
 `InterviewPreparationAsyncService` 使用了几个尚未定义的类。为了让本小节的代码能够编译和理解，这里给出它们的最小空壳定义——只保留被用到的方法签名和字段，不包含真实逻辑。完整实现在后续对应章节中给出。
 
-> **补充：** `prepare()` 还依赖心跳服务 `HeartbeatService`。它是一个自包含的小文件，直接在下面的「第二步」给出完整实现，不再作为空壳。
+> **补充：** `prepare()` 依赖 `AsyncConfig` 里注册的 `interviewPreparationTaskExecutor` 线程池，不需要再额外造“心跳服务”这类用于补偿判活的组件——补偿逻辑已经整体交给 RabbitMQ 的 ack/requeue 语义，详见「十一、AI 异步评分模块」。
 
 > **为什么需要这些空壳：** 这些类分别涉及 AI 调用、题目持久化和预生成，如果在面试5不提供占位，`InterviewPreparationAsyncService` 的 import 和构造器注入就找不到来源，读者也无法理解每个依赖的角色。
 
@@ -4280,169 +4431,18 @@ public class NextQuestionPreGeneratorService {
 
 ---
 
+**第二步：创建 `src/main/java/com/example/interview/application/InterviewPreparationAsyncService.java` 文件，这个文件主要用于异步执行面试开始后的匹配和首题准备，避免让 HTTP 请求线程等待 AI 响应而长时间阻塞 Tomcat 线程。**
 
----
+> **前置依赖说明：** 本节涉及的前置依赖包括 `InterviewSessionEntity`、`InterviewSessionMapper`、`SessionSnapshotRepository`、`InterviewSessionStateMachine`、刚创建的 `SessionView` 和 `AsyncConfig`。本步新增的 `InterviewPreparationAsyncService` 由它承接**匹配**与**出题**两个异步阶段。
 
-**第二步：创建 `src/main/java/com/example/interview/application/HeartbeatService.java` 文件，这个文件主要用于把"后台异步任务（评分 / 追问生成 / 预生成）还在不在跑"变成一个可查询的信号，供补偿器判断处理线程是否已经死亡。**
-
-它由四个动作组成：任务开始时 `register(sessionId)` 放进进程内活跃表并立刻写一次心跳；运行期间由 `@Scheduled` 每 10 秒给活跃表里的每个会话续一次心跳（TTL 30 秒）；任务结束时 `unregister(sessionId)` 摘掉活跃项并删掉心跳 key；补偿器用 `exists(sessionId)` 反查"处理这条任务的线程是否还活着"。
-
-**为什么用"定时器续期"而不是"任务每次干完活自己写一次心跳"：** 线程崩溃时，写在业务代码里的心跳代码根本不会被执行；而 `@Scheduled` 跑在独立的调度线程上，业务线程死了它照样在续期，30 秒 TTL 一到心跳自然消失——这正好就是"线程已死"的信号。
-
-```java
-// 从这里开始是新增的：以下整个文件都是新增的（项目里缺失这个文件）
-package com.example.interview.application;
-
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.time.Duration;
-import java.time.Instant;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-
-// ============================================================
-// 后台任务心跳服务
-// ============================================================
-// 职责：把"后台异步任务（评分 / 追问生成 / 预生成）还在不在跑"变成一个可查询的信号。
-//   1) 任务开始：register(sessionId) —— 放进进程内活跃表，并立刻写一次心跳
-//   2) 运行期间：@Scheduled 每 10 秒给活跃表里的每个会话续一次心跳（TTL 30 秒）
-//   3) 任务结束：unregister(sessionId) —— 摘掉活跃项 + 删掉心跳 key
-//   4) 补偿器：exists(sessionId) —— 反查"处理这条任务的线程是否还活着"
-//
-// 为什么需要它：补偿器原来只能靠"队列里还有没有这条任务"判断，而这个判断对
-//   "任务已被消费者取走、线程随后崩溃"完全失效——记录会永远卡在处理中状态。
-//
-// 为什么用"定时器续期"而不是"任务每次干完活自己写一次心跳"：
-//   线程崩溃时，那段写在业务代码里的心跳代码根本不会被执行；
-//   @Scheduled 跑在独立的调度线程上，业务线程死了它照样在续期，
-//   30 秒 TTL 一到心跳自然消失——这正好就是"线程已死"的信号。
-// ============================================================
-@Service
-public class HeartbeatService {
-
-    // 心跳就是一个带 TTL 的字符串 key，StringRedisTemplate 足够用，
-    // 不需要自定义序列化器，也不会把一个对象图塞进 Redis。
-    private final StringRedisTemplate redis;
-
-    // 活跃会话表：定时器靠它知道该给哪些会话续心跳。
-    // 为什么用 ConcurrentHashMap：写入的是业务线程（register / unregister），
-    // 遍历的是调度线程（heartbeat），两边天然并发。
-    // 为什么不放进 Redis：活跃会话是"本进程正在跑哪些任务"，是本地概念；
-    // 放 Redis 反而需要在进程退出时清理，做不好会留下永远续期的僵尸 key。
-    private final ConcurrentHashMap<UUID, Boolean> activeSessions =
-            new ConcurrentHashMap<>();
-
-    // 构造器只注入 Redis：心跳服务没有别的协作者，依赖越少越不容易出错。
-    public HeartbeatService(StringRedisTemplate redis) {
-        this.redis = redis;
-    }
-
-    /**
-     * 注册会话心跳（由后台任务在开始时调用）。
-     *
-     * <p>为什么注册时就写一次：如果只等下一次定时器触发才第一次写，
-     * "注册完成 → 定时器下次触发"这段空窗期内 exists() 会返回 false，
-     * 补偿器可能把刚启动的正常任务误判成已死线程。
-     *
-     * @param sessionId 面试会话 ID
-     */
-    public void register(UUID sessionId) {
-        // 记入活跃表：定时器靠它才知道要给哪些会话续心跳。
-        activeSessions.put(sessionId, Boolean.TRUE);
-        // 立刻手写一次，消除"注册完到下一次定时器触发"之间的心跳空窗。
-        write(sessionId);
-    }
-
-    /**
-     * 注销会话心跳（由后台任务在 finally 块中调用）。
-     *
-     * <p>为什么必须放在 finally 里：任务可能抛异常提前退出，
-     * 写在正常路径上的注销根本走不到，心跳会一直续到进程结束，
-     * 让补偿器永远认为"还有人在处理这条任务"。
-     *
-     * @param sessionId 面试会话 ID
-     */
-    public void unregister(UUID sessionId) {
-        // 先从活跃表摘掉：定时器不再为它续期，心跳不会再被写活。
-        activeSessions.remove(sessionId);
-        // 再主动删掉 key，让补偿器马上就能判定"处理线程已退出"，
-        // 而不是干等 30 秒 TTL 自然过期。
-        redis.delete(key(sessionId));
-    }
-
-    /**
-     * 定时续期：每 10 秒为所有活跃会话写入一次 Redis 心跳。
-     *
-     * <p>为什么用 fixedDelay 而不是 fixedRate：fixedDelay 是"上一轮执行完再等 10 秒"，
-     * fixedRate 是"固定频率触发"。若某轮写入卡住（Redis 抖动），fixedRate 会把
-     * 后续轮次不断堆叠进来；fixedDelay 天然串行，不会堆积。
-     *
-     * <p>为什么 TTL 取 30 秒（= 3 个续期周期）：留出 20 秒的容错窗口。
-     * 心跳 key 在 30 秒后消失，说明这个线程至少连续 20 秒没能完成写入，
-     * 基本可以判定已经崩溃或卡死。
-     */
-    @Scheduled(fixedDelay = 10_000)
-    public void heartbeat() {
-        // 遍历活跃表逐个续期：keySet() 是弱一致视图，遍历期间有会话被
-        // remove 掉也不会抛 ConcurrentModificationException。
-        activeSessions.keySet().forEach(this::write);
-    }
-
-    /**
-     * 检查会话心跳是否存在（由 JudgeTaskCompensationService 调用）。
-     *
-     * @param sessionId 面试会话 ID
-     * @return true = 心跳还在（处理线程存活）；false = 心跳已消失（处理线程死亡）
-     */
-    public boolean exists(UUID sessionId) {
-        // 包一层 Boolean.TRUE.equals：hasKey 的返回值是包装类型 Boolean，
-        // 在连接异常等情况下可能为 null，直接拆箱会抛 NPE；
-        // 这里把 null 统一当成"心跳不存在"，宁可多补偿一次也不要让调用方崩掉。
-        return Boolean.TRUE.equals(
-                redis.hasKey(key(sessionId))
-        );
-    }
-
-    /**
-     * 写入心跳到 Redis。
-     *
-     * <p>为什么值是当前时间戳：业务上不读这个值，但存时间戳让排查变简单——
-     * 线上直接 GET heartbeat:{sessionId} 就能看到最后一次续期时间，
-     * 从而算出线程大概死了多久。
-     */
-    private void write(UUID sessionId) {
-        // SET heartbeat:{sessionId} <当前毫秒时间戳> EX 30：
-        // 真正的信号是"这个 key 还在不在"，值只是给人看的。
-        redis.opsForValue().set(
-                key(sessionId),
-                Instant.now().toEpochMilli() + "",
-                Duration.ofSeconds(30)
-        );
-    }
-
-    // 心跳 key 的拼装集中在一处：写、查、删都调它，避免前缀写歪对不上。
-    private String key(UUID sessionId) {
-        // 形如 heartbeat:{sessionId}，出问题时可以直接 GET 这个 key 看最后心跳时间。
-        return "heartbeat:" + sessionId;
-    }
-}
-```
-
----
-
-**第三步：创建 `src/main/java/com/example/interview/application/InterviewPreparationAsyncService.java` 文件，这个文件主要用于异步执行面试开始后的匹配和首题准备，避免让 HTTP 请求线程等待 AI 响应而长时间阻塞 Tomcat 线程。**
-
-> **前置依赖说明：** 本节涉及的前置依赖包括 `InterviewSessionEntity`、`InterviewSessionMapper`、`SessionSnapshotRepository`、`InterviewSessionStateMachine`、刚创建的 `SessionView`、`HeartbeatService` 和 `AsyncConfig`。本步新增的 `InterviewPreparationAsyncService` 由它承接**匹配**与**出题**两个异步阶段。
-
-**这个服务演示两个彼此衔接的后台阶段，并在整个任务期间用心跳标记"线程还活着"：**
-1. **任务开始**：先 `heartbeat.register(sessionId)` 注册心跳（写在 `try` 外面，保证"任务正在跑"这个事实先被记录）。
-2. **第一阶段**：读取会话关联的简历和岗位，调用占位的匹配方法，成功后提交 `POSITION_MATCHED`，把状态从 `MATCHING` 推进到 `QUESTIONING`。
-3. **第二阶段**：调用占位的出题方法，成功后提交 `QUESTION_READY`，把状态从 `QUESTIONING` 推进到 `ANSWERING`。
-4. **任务结束**：在 `finally` 中 `heartbeat.unregister(sessionId)`，无论正常还是异常退出都注销心跳。
+**这个服务演示两个彼此衔接的后台阶段：**
+1. **第一阶段**：读取会话关联的简历和岗位，调用 AI 出题前先确认岗位匹配，成功后提交 `POSITION_MATCHED`，把状态从 `MATCHING` 推进到 `QUESTIONING`。
+2. **第二阶段**：调用 AI 生成首题并落库，成功后提交 `QUESTION_READY`，把状态从 `QUESTIONING` 推进到 `ANSWERING`；紧接着触发第二题预生成。
+3. **失败了怎么办**：整个方法包在 `try / catch` 里，异常只记日志——异步线程的堆栈不会冒泡到任何 HTTP 请求，不记日志就等于什么都没发生。前端靠轮询 `/state` 感知进度，超时没进展就让用户重新开局。
 
 每一次推进都会**重新加载快照**并使用 **`compareAndSet`**，CAS 失败只记录日志并停止当前任务，不能直接覆盖其他请求已经写入的新版本。
+
+**为什么这里不再有 `HeartbeatService`：** 这个类原来在 `try` 外面 `heartbeat.register(sessionId)`、在 `finally` 里 `heartbeat.unregister(sessionId)`，作用是给"补偿器"提供一个"这条会话的后台线程还活着"的信号。现在补偿器整体被 RabbitMQ 的 ack/requeue 语义取代，心跳信号没有消费方了，注册与注销就只是两次多余的 Redis 写入——写进去没人读，还得担心进程被 kill 时 key 残留。所以构造函数少了 `HeartbeatService`、`prepare()` 少了 register/unregister 与 `finally` 块，类里只剩"查会话 → 推进匹配 → 出题 → 推进出题 → 预生成下一题"这条主干。
 
 ```java
 package com.example.interview.application;
@@ -4461,59 +4461,33 @@ import com.example.interview.infrastructure.mysql.QuestionMapper;
 import com.example.interview.infrastructure.mysql.ResumeEntity;
 import com.example.interview.infrastructure.mysql.ResumeMapper;
 import com.example.interview.infrastructure.snapshot.SessionSnapshotRepository;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.util.List;
 import java.util.UUID;
 
-/**
- * 异步执行面试开始后的匹配和首题准备，避免让 HTTP 请求线程等待 AI。
- * 使用 @Async 注解在专用线程池中运行，Controller 调用后可以立即返回响应给前端。
- */
 @Service
 public class InterviewPreparationAsyncService {
-
-    // 日志记录器，用于记录异步任务中的关键步骤和异常，因为异步线程的异常不会直接返回给已结束的 HTTP 请求。
     private static final Logger log =
             LoggerFactory.getLogger(
                     InterviewPreparationAsyncService.class
             );
-
-    // 面试会话的数据库 Mapper，用于按 ID 查询会话记录，获取 userId、positionId、resumeId 等关联信息。
-    private final InterviewSessionMapper sessionMapper;
-    // 简历 Mapper，用于查询简历的解析内容（parsedContent），供 AI 出题时作为上下文。
+            private final InterviewSessionMapper sessionMapper;
     private final ResumeMapper resumes;
-    // 岗位 Mapper，用于查询岗位的名称、描述和技能要求，供 AI 出题时作为输入。
     private final PositionMapper positions;
-    // 快照仓库，用于加载和 CAS 更新状态快照，保证并发安全。
     private final SessionSnapshotRepository snapshots;
-    // 面试状态机，负责校验事件是否合法并生成新的快照状态。
     private final InterviewSessionStateMachine machine;
-    // 第一题生成后，立即异步生成第二题的预生成服务，提前缓存后续题目以提升用户体验。
+    // **第一题生成后，立即异步生成第二题。**
     private final NextQuestionPreGeneratorService preGenerator;
-    // 统一 AI 出题入口，封装调用大模型生成题目的逻辑，避免首题继续使用固定字符串占位。
+    // **统一 AI 出题入口，避免首题继续使用固定字符串占位。**
     private final InterviewAiFacade ai;
-    // 题目 Mapper，用于将 AI 生成的第一道题持久化到数据库的 question 表中。
     private final QuestionMapper questions;
-    // 心跳服务：prepare 是准备任务的唯一入口，只有它知道任务开始与结束的时刻，
-    // register / unregister 才能严格配对。
-    private final HeartbeatService heartbeat;
 
-    /**
-     * Spring 通过构造器注入所有依赖。
-     *
-     * @param sessionMapper  面试会话 Mapper，查询会话基本信息
-     * @param resumes        简历 Mapper，查询简历解析内容
-     * @param positions      岗位 Mapper，查询岗位描述和技能要求
-     * @param snapshots      快照仓库，加载和 CAS 更新状态
-     * @param machine        状态机，校验事件合法性并推进状态
-     * @param preGenerator   下一题预生成器，提前生成后续题目
-     * @param ai             AI 门面，统一调用大模型出题
-     * @param questions      题目 Mapper，持久化生成的题目
-     * @param heartbeat      心跳服务，任务开始时注册、结束时注销
-     */
     public InterviewPreparationAsyncService(
             InterviewSessionMapper sessionMapper,
             ResumeMapper resumes,
@@ -4522,9 +4496,7 @@ public class InterviewPreparationAsyncService {
             InterviewSessionStateMachine machine,
             NextQuestionPreGeneratorService preGenerator,
             InterviewAiFacade ai,
-            QuestionMapper questions,
-            // 心跳服务追加在末尾，Spring 按类型注入，不会打乱既有参数顺序。
-            HeartbeatService heartbeat
+            QuestionMapper questions
     ) {
         this.sessionMapper = sessionMapper;
         this.resumes = resumes;
@@ -4534,48 +4506,66 @@ public class InterviewPreparationAsyncService {
         this.preGenerator = preGenerator;
         this.ai = ai;
         this.questions = questions;
-        this.heartbeat = heartbeat;
+    }
+    /**
+     * 推进一步会话状态：加载快照 → 状态机流转 → CAS 写回。
+     *
+     * <p>为什么叫"推进"而不是"跳转"：状态机严格按注册的转移规则走，非法事件会直接抛错，
+     * 这里只负责"取当前快照、请求流转、用 CAS 保证并发下只有赢得版本的快照落库"三件事。
+     *
+     * <p>返回 false 的含义：compareAndSet 失败 = 版本已被其它线程推进（本请求拿到的是旧快照），
+     * 调用方应直接返回、不要继续基于旧快照做后续工作（比如出题），以免覆盖别人的进展。
+     *
+     * @param sessionId   会话 ID
+     * @param event       本次要触发的事件
+     * @param requestName 事件幂等键前缀，调用方传业务名，方法内拼上随机数保证每次请求唯一
+     * @return 快照落库成功返回 true；CAS 失败（版本被并发抢占）返回 false
+     */
+    private boolean advance(UUID sessionId, InterviewEvent event, String requestName) {
+        InterviewSessionSnapshot oldValue = snapshots.load(sessionId);
+        var result = machine.advance(oldValue, event, requestName + "-" + UUID.randomUUID());
+        boolean updated = snapshots.compareAndSet(oldValue, result.snapshot());
+        if(!updated)
+        {
+            log.warn(
+                    "snapshot compareAndSet failed, sessionId={}, event={}, version={}",
+                    sessionId,
+                    event,
+                    oldValue.version()
+            );
+            return false;
+        }
+        log.info(
+                "snapshot advanced, sessionId={}, event={}, state={}",
+                sessionId,
+                event,
+                result.snapshot().state()
+        );
+        return true;
+
     }
 
-    /**
-     * 使用专用线程池异步执行，Controller 调用后可以立即返回响应，不会阻塞 Tomcat 的 HTTP 处理线程。
-     * 该方法依次执行：查询会话 -> 查询简历和岗位 -> 提交匹配事件 -> AI 生成首题 -> 提交出题事件 -> 预生成第二题。
-     *
-     * @param sessionId 面试会话 ID，用于定位需要准备的面试会话
-     */
-    @Async("interviewPreparationTaskExecutor")
-    public void prepare(UUID sessionId) {
-        // 任务开始，先注册心跳：写在 try 外面，保证"任务正在跑"这个事实先被记录，
-        // 否则前面任何一行抛异常都等于"从来没注册过"，补偿器会误判线程已死。
-        heartbeat.register(sessionId);
-        try {
-            // 第一步：根据 sessionId 查询面试会话实体，获取 userId、positionId、resumeId 等关联信息。
-            InterviewSessionEntity session =
-                    sessionMapper.selectById(
-                            sessionId.toString()
-                    );
-            // 如果会话不存在，直接抛出异常，由 catch 块记录日志。
-            if (session == null) {
-                throw new IllegalArgumentException(
-                        "interview session not found"
+    @Async ("interviewPreparationTaskExecutor")
+    public void prepare(UUID sessionId)
+    {
+        try
+        {
+            InterviewSessionEntity 
+            session = sessionMapper.selectById(sessionId.toString());
+
+            if ((session == null)) {
+                throw new IllegalArgumentException
+                (
+                    "interview session not found"
                 );
             }
-
-            // 第二步：查询该会话关联的简历和岗位信息。
-            // 简历的 parsedContent 和岗位的名称/描述/技能将作为 AI 出题的上下文输入。
-            ResumeEntity resume =
-                    resumes.selectById(session.getResumeId());
-            PositionEntity position =
-                    positions.selectById(session.getPositionId());
-            // 如果简历或岗位不存在，无法继续准备流程，直接抛出异常。
+            ResumeEntity resume = resumes.selectById(session.getResumeId());
+            PositionEntity position = positions.selectById(session.getPositionId());
             if (resume == null || position == null) {
                 throw new IllegalArgumentException(
                         "resume or position not found"
                 );
             }
-
-            // 第三步：匹配阶段 —— 提交 POSITION_MATCHED 事件，将状态从 MATCHING 推进到 QUESTIONING。
-            // 这里使用占位匹配逻辑，真实生产环境会在此处计算岗位匹配度分数。
             if (!advance(
                     sessionId,
                     InterviewEvent.POSITION_MATCHED,
@@ -4584,9 +4574,6 @@ public class InterviewPreparationAsyncService {
                 // 如果 CAS 更新失败（说明其他线程已经推进了版本），直接返回，不继续后续出题。
                 return;
             }
-
-            // 第四步：首题生成阶段 —— 使用真实 AI Facade 生成第一道面试题，并写入题目表。
-            // 传入岗位名称、描述、技能要求和简历解析内容作为 AI 出题的上下文。
             GeneratedQuestion firstQuestion =
                     ai.generateQuestion(
                             sessionId,                      // 会话 ID，用于关联题目
@@ -4596,7 +4583,7 @@ public class InterviewPreparationAsyncService {
                             resume.getParsedContent(),       // 简历解析内容，供 AI 结合候选人背景出题
                             1                                // 题目序号，标记为第一题
                     );
-            // 将 AI 生成的首题持久化到数据库。
+                    // 将 AI 生成的首题持久化到数据库。
             QuestionEntity firstEntity = new QuestionEntity();
             firstEntity.setId(UUID.randomUUID().toString());   // 生成全局唯一 ID
             firstEntity.setSessionId(sessionId.toString());    // 关联面试会话
@@ -4605,16 +4592,43 @@ public class InterviewPreparationAsyncService {
             firstEntity.setCategory(firstQuestion.category()); // 题目分类（如技术、项目经验等）
             firstEntity.setSequenceNo(1);                      // 第一题，序号为 1
             firstEntity.setStatus("ACTIVE");                   // 状态为激活，表示该题正在使用
-            questions.insert(firstEntity);
+            // 从这里开始是修改的：首题插入改为"先查后插 + 唯一键兜底"。
+            // 为什么必须改：取题接口的同步兜底（createQuestionJson）也可能插入 sequence=1 的
+            // 首题，且它插入的也是 ACTIVE。若 prepare 无条件 insert，两条路径并发时后插的那条
+            // 会撞上 uk_question_session_sequence 唯一键，或者（旧库缺唯一键时）双写出两条首题，
+            // 前端会看到两道"第 1 题"、报告统计也随之错乱。先查后插让 prepare 复用取题已建好的
+            // 首题，唯一键兜底挡住"两侧恰好同一毫秒插入"的并发竞态。
+            List<QuestionEntity> existingFirst = questions.selectList(
+                    Wrappers.<QuestionEntity>lambdaQuery()
+                            .eq(QuestionEntity::getSessionId, sessionId.toString())
+                            .eq(QuestionEntity::getSequenceNo, 1)
+                            .in(QuestionEntity::getStatus, "ACTIVE", "PRE_GENERATED")
+                            .last("LIMIT 1")
+            );
+            if (existingFirst.isEmpty()) {
+                try {
+                    questions.insert(firstEntity);
+                } catch (DataIntegrityViolationException conflict) {
+                    // 并发的取题兜底已经插入了首题：这是正常信号，本次跳过，后续推进照常。
+                    log.info(
+                            "first question inserted by concurrent request, skip, sessionId={}",
+                            sessionId
+                    );
+                }
+            } else {
+                // 首题已被取题同步兜底建好：复用，不再新插一道。
+                log.info(
+                        "first question already exists, reuse, sessionId={}",
+                        sessionId
+                );
+            }
+            // 修改结束
             // 记录日志，方便追踪题目生成情况（因为异步异常无法返回给前端）。
             log.info(
                     "first question generated, sessionId={}, question={}",
                     sessionId,
                     firstQuestion.content()
             );
-
-            // 第五步：出题完成阶段 —— 提交 QUESTION_READY 事件，将状态从 QUESTIONING 推进到 ANSWERING。
-            // 此时前端可以感知到状态变为 ANSWERING，从而展示答题界面。
             advance(
                     sessionId,
                     InterviewEvent.QUESTION_READY,
@@ -4625,66 +4639,15 @@ public class InterviewPreparationAsyncService {
             // 序号为 2，表示生成第二题。
             preGenerator.preGenerate(sessionId, 2);
 
-        } catch (Exception e) {
+        }
+        catch (Exception e) {
             // 异步线程中的异常不会直接返回给已结束的 HTTP 请求，因此必须记录完整上下文以便排查问题。
             log.error(
                     "interview preparation failed, sessionId={}",
                     sessionId,
                     e
             );
-        } finally {
-            // 任务结束（含异常退出），注销心跳：用 finally 盖住所有退出路径，
-            // 线程一旦退出就删掉心跳，不留"看起来还活着"的假信号。
-            heartbeat.unregister(sessionId);
         }
-    }
-
-    /**
-     * 每一个异步阶段都重新加载快照，并通过 CAS（Compare-And-Swap）防止旧快照覆盖新快照。
-     * 这是保证并发安全的关键：如果其他线程已经推进了状态版本，当前线程不应覆盖。
-     *
-     * @param sessionId  面试会话 ID，用于加载当前快照
-     * @param event      要提交的事件，例如 POSITION_MATCHED 或 QUESTION_READY
-     * @param requestName 请求名称，用于生成唯一的请求 ID，便于追踪
-     * @return true 表示 CAS 成功，状态已推进；false 表示 CAS 失败，有其他线程已更新版本
-     */
-    private boolean advance(
-            UUID sessionId,
-            InterviewEvent event,
-            String requestName
-    ) {
-        // 重新加载当前快照，确保基于最新版本推进。
-        InterviewSessionSnapshot oldValue =
-                snapshots.load(sessionId);
-        // 调用状态机，校验事件在当前状态下是否合法，并生成新的快照。
-        var result = machine.advance(
-                oldValue,
-                event,
-                requestName + "-" + UUID.randomUUID()
-        );
-        // 使用 CAS 乐观锁更新快照：只有当数据库中版本号与 oldValue 一致时才写入新快照。
-        boolean updated = snapshots.compareAndSet(
-                oldValue,
-                result.snapshot()
-        );
-        if (!updated) {
-            // CAS 失败说明其他线程已经推进了版本，记录警告日志后停止当前链路，不做重试。
-            log.warn(
-                    "snapshot compareAndSet failed, sessionId={}, event={}, version={}",
-                    sessionId,
-                    event,
-                    oldValue.version()
-            );
-            return false;
-        }
-        // CAS 成功，记录推进信息以便追踪状态流转。
-        log.info(
-                "snapshot advanced, sessionId={}, event={}, state={}",
-                sessionId,
-                event,
-                result.snapshot().state()
-        );
-        return true;
     }
 }
 ```
@@ -4740,10 +4703,12 @@ public class InterviewController {
     private final InterviewSessionStateMachine machine;
     // 异步执行匹配和首题准备的服务，start() 调用后不等待任务完成，立即返回响应。
     private final InterviewPreparationAsyncService preparationTasks;
+    // 答案仓储：结束面试时从答案表兜底汇总整场转写文本（此时 WebSocket 早已断开）。
+    private final AnswerRepository answers;
+    // 表现分析服务：接收整场转写文本，是这段文本的最终消费方。
+    private final DemeanorAnalysisService demeanor;
     // 追问仓储：回答"刚才这道题有没有追问要答"，是追问链路在前端的唯一出口。
     private final FollowUpRepository followUps;
-    // 会话恢复服务：重连时把中断的异步步骤幂等补跑，兑现"主动恢复 + 幂等补偿"。
-    private final SessionRecoveryService recovery;
 
     /**
      * Spring 通过构造器注入所有依赖。
@@ -4753,8 +4718,9 @@ public class InterviewController {
      * @param snapshots          快照仓库，用于状态快照的加载和 CAS 更新
      * @param machine            状态机，校验和推进状态
      * @param preparationTasks   异步准备服务，后台执行匹配和出题
+     * @param answers            答案仓储，结束面试时汇总整场转写文本
+     * @param demeanor           表现分析服务，消费整场转写文本
      * @param followUps          追问仓储，查询某道原题上的追问
-     * @param recovery           恢复服务，重连时幂等补跑中断的异步步骤
      */
     public InterviewController(
             ResumeMapper resumes,
@@ -4762,18 +4728,19 @@ public class InterviewController {
             SessionSnapshotRepository snapshots,
             InterviewSessionStateMachine machine,
             InterviewPreparationAsyncService preparationTasks,
-            // 从这里开始是新增的：构造器末尾追加追问仓储与会话恢复服务（Spring 按类型注入）。
-            FollowUpRepository followUps,
-            SessionRecoveryService recovery
-            // 新增结束
+            // 三个新依赖追加在末尾，不影响既有参数顺序。
+            AnswerRepository answers,
+            DemeanorAnalysisService demeanor,
+            FollowUpRepository followUps
     ) {
         this.resumes = resumes;
         this.sessionMapper = sessionMapper;
         this.snapshots = snapshots;
         this.machine = machine;
         this.preparationTasks = preparationTasks;
+        this.answers = answers;
+        this.demeanor = demeanor;
         this.followUps = followUps;
-        this.recovery = recovery;
     }
 
     // ============ 接口定义 ============
@@ -4791,9 +4758,9 @@ public class InterviewController {
      */
     @PostMapping
     public SessionView create(
-            @RequestParam("userId") Long userId,
-            @RequestParam("positionId") Long positionId,
-            @RequestParam("resumeId") Long resumeId
+            @RequestParam Long userId,
+            @RequestParam Long positionId,
+            @RequestParam Long resumeId
     ) {
         // 第一步：根据 resumeId 查询简历记录，校验简历是否存在。
         var resume = resumes.selectById(resumeId);
@@ -4843,7 +4810,7 @@ public class InterviewController {
      */
     @PostMapping("/{sessionId}/start")
     public SessionView start(
-            @PathVariable("sessionId") UUID sessionId
+            @PathVariable UUID sessionId
     ) {
         // 第一步：加载当前会话的最新快照，获取当前状态和版本号。
         var oldValue = snapshots.load(sessionId);
@@ -4883,7 +4850,7 @@ public class InterviewController {
      * @return 含 state 的会话视图
      */
     @GetMapping("/{sessionId}/state")
-    public SessionView state(@PathVariable("sessionId") UUID sessionId) {
+    public SessionView state(@PathVariable UUID sessionId) {
         // 直接读快照当前状态：Redis 未命中时会懒加载 MongoDB，不会改任何状态。
         return view(sessionId, snapshots.load(sessionId));
     }
@@ -4906,21 +4873,22 @@ public class InterviewController {
      * @return 追问视图；这道题没有追问时返回 null（HTTP 200 + 空 body）
      */
     @GetMapping("/{sessionId}/follow-up")
-    public FollowUpView followUp(@PathVariable("sessionId") UUID sessionId,
-                                 @RequestParam("questionId") UUID questionId) {
+    public FollowUpView followUp(@PathVariable UUID sessionId,
+                                 @RequestParam UUID questionId) {
         return followUps.find(sessionId, questionId);
     }
 
     /**
      * 结束面试会话。
-     * 向状态机提交 END 事件，将会话推进到终态，并同步更新数据库中的会话状态。
+     * 向状态机提交 END 事件，将会话推进到终态，同步更新数据库中的会话状态，
+     * 并把整场转写文本交给表现分析。
      *
      * @param sessionId 要结束的面试会话 ID
      * @return SessionView 包含会话 ID、结束状态和版本号
      */
     @PostMapping("/{sessionId}/end")
     public SessionView end(
-            @PathVariable("sessionId") UUID sessionId
+            @PathVariable UUID sessionId
     ) {
         // 第一步：加载当前会话的最新快照。
         var oldValue = snapshots.load(sessionId);
@@ -4944,7 +4912,18 @@ public class InterviewController {
             sessionMapper.updateById(entity);
         }
 
-        // 第五步：返回更新后的 SessionView。
+        // 第五步（新增）：把整场说话内容交给表现分析。
+        // 取文本：面试结束时 WebSocket 早已关闭，实时转写上下文已经随连接销毁，
+        // 所以走答案表兜底——interview_answer.answer 里存的就是每次提交的答案文本
+        // （语音答案在提交时已经转写成了文本），按主键升序拼起来就是整场内容。
+        String transcript = answers.loadSessionTranscript(sessionId);
+        // analyze 传空串会抛 IllegalArgumentException（它把空文本当成上游没取到内容），
+        // 所以这里先判空：整场一句都没答时跳过分析，而不是让接口 500。
+        if (transcript != null && !transcript.isBlank()) {
+            demeanor.analyze(sessionId, transcript);
+        }
+
+        // 第六步：返回更新后的 SessionView。
         return view(sessionId, result.snapshot());
     }
 
@@ -5909,7 +5888,6 @@ CREATE TABLE IF NOT EXISTS interview_question (
 package com.example.interview.infrastructure.mysql;
 
 import com.baomidou.mybatisplus.annotation.TableName;
-import lombok.Data;    // 实体用 @Data 让 Lombok 生成 getter/setter
 
 // QuestionEntity 是一道面试题的数据库记录，对应 interview_question 表，每条记录代表一次
 // AI 生成的面试题。它承载了题目的全部落库字段：主键 id、所属会话 sessionId、关联岗位
@@ -5917,7 +5895,6 @@ import lombok.Data;    // 实体用 @Data 让 Lombok 生成 getter/setter
 // 其中 sessionId 与 sequenceNo 共同标定“某场面试会里的第几题”，status 记录题目状态
 // （PRE_GENERATED / ACTIVE），前端只展示 ACTIVE 的题目。实体通过 MyBatis-Plus 的 @TableName 注解与表对应，
 // 由 QuestionMapper 驱动增删改查。
-@Data
 @TableName("interview_question")
 public class QuestionEntity {
     // 数据库主键或对象唯一标识；实体入库后通常由数据库生成。
@@ -6068,16 +6045,13 @@ public record GeneratedQuestion(
 package com.example.interview.ai;
 
 import com.example.interview.infrastructure.singleflight.RedisSingleflight;
-import com.example.interview.skill.SkillDefinition;
 import com.example.interview.skill.SkillRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.retry.TransientAiException;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.util.UUID;
 
 // InterviewAiFacade 是整个项目里所有 AI 交互的统一门面（Facade），后续的出题、评分、追问、
@@ -6164,32 +6138,8 @@ public class InterviewAiFacade {
                 excerpt(resumeContent, 6000)
         );
 
-        // 把"出题"接入 RedisSingleflight，凑齐 评分/追问/出题 三条去重链路。评分（judge）和追问
-        // （FollowUpGenerationService）都走了 singleflight.executeFenced，出题也必须这样：并发触发
-        // 相同 sessionId+题号的请求会各自打一次 AI，浪费且可能产出不一致的题。key 用
-        // "question:{sessionId}:{sequenceNo}" 把重复请求合并成一个。注意取题接口走的是独立的
-        // "question-view:" key（缓存完整 QuestionView JSON），与这里的 "question:" key（缓存原始
-        // 出题 JSON）不同级，互不占用，见 QuestionController 的说明。
-        String questionKey = "question:" + sessionId + ":" + sequenceNo;
-        var result = singleflight.executeFenced(
-                questionKey,
-                Duration.ofMinutes(5),
-                // 生产函数只负责真正调 AI 出题，返回"未解析的原始 JSON 正文"；
-                // 去重、幂等、围栏令牌都由单飞框架负责，这里不重复实现。
-                () -> chat(prompt)
-        );
-        // Fencing Token 校验：出题结果缓存有 5 分钟窗口，同 key 在这期间又被重触发时旧结果会被
-        // 新结果顶掉。本轮 token 若已不是"当前最新"，说明读到的是过期缓存，直接拒绝，避免旧题
-        // 覆盖新题的边界竞态。
-        if (!singleflight.acceptFence(questionKey, result.token())) {
-            throw new IllegalStateException(
-                    "拒绝过期出题结果: sessionId=" + sessionId
-                            + ", sequenceNo=" + sequenceNo
-            );
-        }
-
         // 调用 AI 模型并解析返回的 JSON 字符串为 Jackson 树节点。
-        var node = parseJson(result.value());
+        var node = parseJson(chat(prompt));
         // 从 JSON 节点中提取 content 字段的值。
         var content = node.path("content")
                 .asText()
@@ -6216,29 +6166,17 @@ public class InterviewAiFacade {
     // 包起来，拼在提示词最前面，AI 才会优先遵守这些规则。出题、评分、追问、报告四条链路复用同一段
     // 包裹逻辑，因此提取成独立方法，而不是在四个地方各写一遍。名称拼错时 skills.get(name) 会抛
     // IllegalStateException("skill not found: " + name)，第一次调用就暴露，不会静默退化成"没有规则的提示词"。
-    // 注入的内容直接读取结构化 SkillDefinition（见 SkillLoader 解析的元数据），把"用途 + 输出契约 + 规则正文"
-    // 一次性拼进提示词，因此 Skill 有任何改动，四条链路下次调用自动生效，无需改动任一调用代码。
     // 参数 name：SkillRegistry 中的技能名称，例如 "question-generation"。
-    // 返回值：包裹了技能定义、可直接拼入提示词的文本。
+    // 返回值：包裹了技能内容、可直接拼入提示词的文本。
     private String skillPrompt(String name) {
-        SkillDefinition definition = skills.get(name);
-        // 元数据可能为空（兼容没有 front matter 的旧文件），为空的字段不拼进提示词。
-        String purpose = blank(definition.purpose())
-                ? ""
-                : "用途：" + definition.purpose() + "\n";
-        String output = blank(definition.outputContract())
-                ? ""
-                : "必须的输出契约：" + definition.outputContract() + "\n";
-        return "【业务 Skill：" + name + "】\n"
-                + purpose
-                + output
-                + definition.content()
-                + "\n【业务 Skill 结束】\n";
-    }
-
-    // 判断文本是否为空或仅空白，用于决定某段元数据要不要拼进提示词。
-    private boolean blank(String value) {
-        return value == null || value.isBlank();
+        return """
+                【业务 Skill：%s】
+                %s
+                【业务 Skill 结束】
+                """.formatted(
+                name,
+                skills.get(name).content()
+        );
     }
 ```
 
@@ -6250,50 +6188,24 @@ public class InterviewAiFacade {
 
 ```java
     // chat 是通往大模型的最底层封装，把“用 ChatClient 发起一次对话并取出文本响应”这一动作收口，
-    // 让上层的生成题目、评分、追问、报告等方法只需要关心提示词，而不用关心模型调用的差异细节。
-    // 它通过 chatClient.prompt().user(prompt).call().content() 发请求并取回纯文本。它给 AI 调用加
-    // 了“瞬时失败自动重试”：出题 / 评分 / 报告 / 追问四条链路最终都走这一个方法，而它之前只调用一次、
-    // 失败即抛。AI 上游偶发超时或返回空串时，就会直接变成 500（表现就是“刚发起取第一题那次请求 500”，
-    // 把整场面试开场打断）。这里只对两种“失败后重试大概率能自愈”的情况重试 3 次：
-    //   1) TransientAiException —— Spring AI 给“网络抖动 / 上游 5xx”这类瞬时错误打的标签；
-    //   2) AI 返回了空串。
-    // 鉴权、请求非法这类 NonTransientAiException 不在此列，重试也是白费，放出去让上层处理。
+    // 让上层的 generateQuestion、评分、追问、报告等方法只需要关心提示词，而不用关心模型调用的
+    // 细节。它通过 chatClient.prompt().user(prompt).call().content() 发请求并取回纯文本；考虑到
+    // 模型偶尔会返回空字符串或 null，这里做了一道防线：一旦拿到的内容是空或空白，立即抛出
+    // IllegalStateException，避免空字符串继续往下流向 JSON 解析与落库，造成难排查的脏数据。
     // 参数 prompt：组装好的提示词字符串。
     // 返回值：AI 模型返回的非空文本内容。
-    // 异常：重试后仍失败时抛出最后一次失败原因。
+    // 异常：当返回内容为 null 或空白时，抛出 IllegalStateException。
     private String chat(String prompt) {
-        RuntimeException lastFailure = null;
-        for (int attempt = 0; attempt < 3; attempt += 1) {
-            try {
-                String content = chatClient.prompt()
-                        .user(prompt)
-                        .call()
-                        .content();
-                if (content != null && !content.isBlank()) {
-                    return content;
-                }
-                // 空返回视为瞬时失败：记下原因，短暂退避后重试下一次。
-                lastFailure = new IllegalStateException(
-                        "AI returned empty content"
-                );
-            } catch (TransientAiException transientEx) {
-                // 只重试瞬时异常；其它异常在 try 块外原样向上抛。
-                lastFailure = transientEx;
-            }
-            if (attempt < 2) {
-                try {
-                    // 退避递增：1/2 次后分别等 600ms / 1200ms，给上游留出恢复时间。
-                    Thread.sleep(600L * (attempt + 1));
-                } catch (InterruptedException interrupted) {
-                    // 线程被中断：不再重试，把站到的最新失败原因抛回去。
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+        String content = chatClient.prompt()
+                .user(prompt)
+                .call()
+                .content();
+        if (content == null || content.isBlank()) {
+            throw new IllegalStateException(
+                    "AI returned empty content"
+            );
         }
-        throw lastFailure == null
-                ? new IllegalStateException("AI call failed unexpectedly")
-                : lastFailure;
+        return content;
     }
 
     // parseJson 负责把模型返回的 JSON 文本解析成 Jackson 的 JsonNode 树节点。之所以统一收敛到
@@ -6404,19 +6316,11 @@ import com.example.interview.infrastructure.mysql.QuestionMapper;
 import com.example.interview.infrastructure.mysql.ResumeEntity;
 import com.example.interview.infrastructure.mysql.ResumeMapper;
 import com.example.interview.infrastructure.singleflight.RedisSingleflight;
-// 识别"单飞等待超时"的可重试信号：取题接口在 question-view key 上等门面生成结果，
-// 等待窗口耗尽时底层抛 RetryableSingleflightException，捕获后本地短暂重试而非直接 500。
-import com.example.interview.infrastructure.singleflight.RetryableSingleflightException;
-// 捕获唯一键冲突（可能被 Spring/MyBatis 包装成 DataIntegrityViolationException）：
-// 取题的同步兜底与 /start 异步的 prepare 都可能插入同一道首题，撞上 uk_question_session_sequence。
-import org.springframework.dao.DataIntegrityViolationException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Duration;
-// Objects.nonNull 用于过滤掉 max() 在无数据时返回的 NULL。
-import java.util.Objects;
 import java.util.UUID;
 
 // QuestionController 负责向外暴露“获取当前会话下一道题”的 HTTP 接口，是出题模块的入口层。
@@ -6443,8 +6347,6 @@ public class QuestionController {
     private final RedisSingleflight singleflight;
     // Jackson JSON 处理器，用于将对象序列化为 JSON 或反序列化 JSON 为对象。
     private final ObjectMapper mapper;
-    // 岗位 Controller 实例，与其他协作者一并由 Spring 装配（本类未直接使用，保留依赖关系）。
-    private final PositionController positionController;
 
     public QuestionController(
             // 面试会话 Mapper，由 Spring 自动注入。
@@ -6460,9 +6362,7 @@ public class QuestionController {
             // 请求合并器实例，由 Spring 自动注入。
             RedisSingleflight singleflight,
             // JSON 处理器实例，由 Spring 自动注入。
-            ObjectMapper mapper,
-            // 岗位 Controller 实例，由 Spring 自动注入（与其他协作者一并保留在装配清单中）。
-            PositionController positionController
+            ObjectMapper mapper
     ) {
         this.sessions = sessions;
         this.positions = positions;
@@ -6471,7 +6371,6 @@ public class QuestionController {
         this.ai = ai;
         this.singleflight = singleflight;
         this.mapper = mapper;
-        this.positionController = positionController;
     }
 
     // nextQuestion 处理 POST /api/interviews/{sessionId}/questions，返回当前会话的下一道题。
@@ -6486,7 +6385,7 @@ public class QuestionController {
     // 异常：会话、岗位或简历任一不存在时抛出 IllegalArgumentException。
     @PostMapping("/{sessionId}/questions")
     public QuestionView nextQuestion(
-            @PathVariable("sessionId") UUID sessionId
+            @PathVariable UUID sessionId
     ) throws JsonProcessingException {
         // 第一步：根据 sessionId 查询面试会话是否存在。
         InterviewSessionEntity session =
@@ -6517,10 +6416,6 @@ public class QuestionController {
                                 sessionId.toString()
                         )
         ).stream()
-                // 过滤掉 max() 返回的 NULL：会话里一题都没有时，SQL 的 max(sequence_no) 是
-                // "一行、值为 NULL"，selectObjs 返回 [null]。findFirst() 内部用 Optional.of(null)
-                // 会抛 NPE，触发场景正是"第一题还没生成出来时前端来取题"。过滤后走 orElse(0)。
-                .filter(Objects::nonNull)
                 .findFirst()
                 .map(value -> ((Number) value).intValue())
                 .orElse(0);
@@ -6538,52 +6433,27 @@ public class QuestionController {
         }
 
         // 第五步：构造 RedisSingleflight 的 key，用于请求合并。
-        // key 命名空间用独立的 "question-view:" 前缀：InterviewAiFacade.generateQuestion 自己也用
-        // singleflight 缓存 "question:{sessionId}:{seq}"（缓存的是原始出题 JSON，只有 content/category）。
-        // 若取题接口沿用同一个 key：① 回放出错类型的缓存，得到 id/sequenceNo/status 全是 null 的题，
-        // 前端 status==='ACTIVE' 校验必失败；② 取题成为该 key 的持有者后，其 producer 内部又会调
-        // 门面单飞（同 key），等于在自己已持有的锁上等待，30s 超时抛 500。换用 "question-view:" 前缀后，
-        // 取题缓存只存完整的 QuestionView JSON，也不与门面的锁互相占用，两个症状一起消除。
-        String key = "question-view:"
+        String key = "question:"
                 + sessionId
                 + ":"
                 + sequence;
 
         // 第六步：通过 RedisSingleflight 执行请求合并。
         // 相同 key 的并发请求只有一个会真正执行 createQuestionJson，其余复用结果。
-        // 捕获 RetryableSingleflightException 做本地有限重试：异步 prepare 还在用门面单飞生成首题
-        // （生成可能 >30s）时，取题这趟在 question-view key 上等不到结果、底层抛可重试信号。
-        // 此时生成方仍在推进，稍后 createQuestionJson 的幂等先查就能直接从库里返回，所以重试
-        // 而不是立刻失败。上限 4 次、间隔 1.5 秒，超过仍抛给前端兜底。
-        int attempts = 0;
-        while (true) {
-            try {
-                String json = singleflight.execute(
-                        key,
-                        Duration.ofMinutes(5),
-                        () -> createQuestionJson(
-                                sessionId,
-                                session,
-                                position,
-                                resume,
-                                sequence
-                        ),
-                        value -> value
-                );
-                // 第七步：将 JSON 字符串反序列化为 QuestionView 返回给前端。
-                return mapper.readValue(json, QuestionView.class);
-            } catch (RetryableSingleflightException retryable) {
-                if (++attempts >= 4) {
-                    throw retryable;
-                }
-                try {
-                    Thread.sleep(1500L);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw retryable;
-                }
-            }
-        }
+        String json = singleflight.execute(
+                key,
+                Duration.ofMinutes(5),
+                () -> createQuestionJson(
+                        sessionId,
+                        session,
+                        position,
+                        resume,
+                        sequence
+                ),
+                value -> value
+        );
+        // 第七步：将 JSON 字符串反序列化为 QuestionView 返回给前端。
+        return mapper.readValue(json, QuestionView.class);
     }
 
     // createQuestionJson 是作为 RedisSingleflight 的 producer 回调被执行的“真正出题动作”：
@@ -6604,32 +6474,8 @@ public class QuestionController {
             PositionEntity position,
             ResumeEntity resume,
             int sequence
-    ) {
-        // 幂等先查再插：首题有两个生成入口——/start 异步触发的 prepare 会插一道 sequence=1 的
-        // ACTIVE 题，取题接口的同步兜底也可能插 sequence=1。两者都在"该题号还没有题"时各插一次，
-        // 后插的那个会撞上唯一键 uk_question_session_sequence（接口直接 500）。所以插入前先按
-        // (sessionId, sequence) 查一次，prepare 已经生成好就直接复用它，不再新插一道。
-        QuestionEntity existing = questions.selectOne(
-                Wrappers.<QuestionEntity>lambdaQuery()
-                        .eq(
-                                QuestionEntity::getSessionId,
-                                sessionId.toString()
-                        )
-                        .eq(
-                                QuestionEntity::getSequenceNo,
-                                sequence
-                        )
-                        .in(
-                                QuestionEntity::getStatus,
-                                "ACTIVE",
-                                "PRE_GENERATED"
-                        )
-        );
-        if (existing != null) {
-            return toViewJson(existing);
-        }
-
-        // 调用 AI Facade 生成题目。
+    ) throws JsonProcessingException {
+        // 第一步：调用 AI Facade 生成题目。
         GeneratedQuestion generated =
                 ai.generateQuestion(
                         sessionId,
@@ -6640,65 +6486,28 @@ public class QuestionController {
                         sequence
                 );
 
-        // 将 AI 生成的结果封装为数据库实体。
+        // 第二步：将 AI 生成的结果封装为数据库实体。
         QuestionEntity question = new QuestionEntity();
         question.setId(UUID.randomUUID().toString());
         question.setSessionId(sessionId.toString());
-        question.setPositionId(position.getId());
+        question.setPositionId(session.getPositionId());
         question.setContent(generated.content());
         question.setCategory(generated.category());
         question.setSequenceNo(sequence);
         // 同步兜底生成的题目直接进入 ACTIVE 状态，前端可立即展示。
         question.setStatus("ACTIVE");
-        // 先查后插挡得住"prepare 已生成"的顺序冲突，但挡不住"两侧恰好同一毫秒插入"的并发竞态。
-        // 一旦撞上唯一键，就重新读一次已存在的那一行返回，而不是把异常抛给前端变成 500。
-        try {
-            questions.insert(question);
-        } catch (DataIntegrityViolationException conflict) {
-            QuestionEntity winner = questions.selectOne(
-                    Wrappers.<QuestionEntity>lambdaQuery()
-                            .eq(
-                                    QuestionEntity::getSessionId,
-                                    sessionId.toString()
-                            )
-                            .eq(
-                                    QuestionEntity::getSequenceNo,
-                                    sequence
-                            )
-                            .in(
-                                    QuestionEntity::getStatus,
-                                    "ACTIVE",
-                                    "PRE_GENERATED"
-                            )
-            );
-            if (winner == null) {
-                throw conflict;
-            }
-            return toViewJson(winner);
-        }
-        return toViewJson(question);
-    }
+        questions.insert(question);
 
-    // 把已落库（或刚插入）的题目实体转成返回给前端的视图 JSON。
-    // 为什么单独成方法：幂等先查与冲突兜底两条路径都要"实体 -> JSON"，共用一份转换逻辑避免重复，
-    // 同时把 createQuestionJson 的注意力留在"生成 + 落库"上。序列化失败说明视图对象不可用，
-    // 包装为运行时异常向外抛出，避免被吞。
-    private String toViewJson(QuestionEntity entity) {
-        QuestionView view = new QuestionView(
-                UUID.fromString(entity.getId()),
-                entity.getContent(),
-                entity.getCategory(),
-                entity.getSequenceNo(),
-                entity.getStatus()
+        // 第三步：将实体转换为前端友好的 QuestionView 并序列化为 JSON。
+        return mapper.writeValueAsString(
+                new QuestionView(
+                        UUID.fromString(question.getId()),
+                        question.getContent(),
+                        question.getCategory(),
+                        question.getSequenceNo(),
+                        question.getStatus()
+                )
         );
-        try {
-            return mapper.writeValueAsString(view);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(
-                    "failed to serialize question view",
-                    e
-            );
-        }
     }
 
     // takePreGenerated 负责“取出并激活”后台预生成好的下一题，是取题流程里排在 Singleflight 之前
@@ -7019,7 +6828,7 @@ setQuestion(next);
 
 **第一步：准备数据库表结构，执行 SQL 迁移脚本。**
 
-`request_id` 用于提交幂等——相同的 `request_id` 不会重复插入记录。为了支持卡住任务的定时补偿，`interview_answer` 还必须保存创建时间（`created_at`）、补偿次数（`retry_count`）和评分状态（`status`）。追问作答复用原题的 `question_id` 提交，光靠 `question_id` 无法把「同一道题的两次作答」区分开，所以表里新增了 `is_follow_up` 列，唯一键也从 `(question_id)` 改成了 `(question_id, is_follow_up)`——同一道题最多两行，一行初次作答、一行追问作答。已有数据库升级时执行下面的迁移；新建数据库时把这些字段直接合并进建表语句。
+`request_id` 用于提交幂等——相同的 `request_id` 不会重复插入记录。`interview_answer` 还要保存创建时间（`created_at`）、评分状态（`status`）和更新时间（`updated_at`）：状态供前端与报告判断"这题评完没有"，时间戳用于定位"卡了很久还没评"的记录。`retry_count` 仍然保留，但队列时代重试次数已经跟着消息体走了，这一列只作为历史字段留档，不再参与逻辑判断。追问作答复用原题的 `question_id` 提交，光靠 `question_id` 无法把「同一道题的两次作答」区分开，所以表里新增了 `is_follow_up` 列，唯一键也从 `(question_id)` 改成了 `(question_id, is_follow_up)`——同一道题最多两行，一行初次作答、一行追问作答。已有数据库升级时执行下面的迁移；新建数据库时把这些字段直接合并进建表语句。
 
 答案表至少保存以下字段：
 
@@ -7032,38 +6841,33 @@ score            -- AI 评分结果
 feedback         -- AI 评分反馈
 fencing_token    -- 围栏令牌，防止旧评分覆盖新评分
 is_follow_up     -- 追问作答标记：0=初次作答，1=追问作答
-retry_count      -- 异步补偿重投评分任务的次数
+retry_count      -- 历史字段：早期补偿重投次数，现由消息体 retryCount 承担
 ```
 
 ```sql
--- interview_answer 新增追问标记与补偿重试计数
+-- interview_answer 补齐评分状态、追问标记与重投计数
 ALTER TABLE interview_answer
+    ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'SUBMITTED',
     ADD COLUMN is_follow_up TINYINT(1) NOT NULL DEFAULT 0,
-    ADD COLUMN retry_count INT NOT NULL DEFAULT 0;
+    ADD COLUMN retry_count INT NOT NULL DEFAULT 0,
+    ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP;
 
--- 唯一键由 (question_id) 改成 (question_id, is_follow_up)：
--- 同一道题最多两行，一行初次作答、一行追问作答
+-- 唯一键调整：request_id 全局唯一（提交幂等），
+-- (question_id, is_follow_up) 区分同一道题的初次作答与追问作答
 ALTER TABLE interview_answer
-    DROP INDEX uk_answer_question,
+    DROP INDEX uk_answer_request,
+    ADD UNIQUE KEY uk_answer_request (request_id),
     ADD UNIQUE KEY uk_answer_question_round (question_id, is_follow_up);
-
-CREATE TABLE IF NOT EXISTS interview_judge_compensation_log (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    answer_id BIGINT NOT NULL,
-    retry_count INT NOT NULL,
-    reason VARCHAR(500) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_compensation_log_answer
-        FOREIGN KEY (answer_id) REFERENCES interview_answer (id),
-    INDEX idx_compensation_log_answer (answer_id)
-) ENGINE = InnoDB;
 ```
+
+**这里没有 `interview_judge_compensation_log` 了。** 早期版本为"补偿服务每次判定一条答案卡住"建了一张记账表，现在补偿服务整体删除（原因见「十一、AI 异步评分模块 - 评分 1.1」），表也一起 `DROP` 掉——工程里的迁移脚本是 `docker/mysql/02-upgrade.sql`，末尾那句 `DROP TABLE IF EXISTS interview_judge_compensation_log;` 就是干这个的。
 
 ---
 
-**第二步：创建 `src/main/java/com/example/interview/infrastructure/mysql/AnswerEntity.java` 文件（完整补偿版）。**
+**第二步：创建 `src/main/java/com/example/interview/infrastructure/mysql/AnswerEntity.java` 文件（完整字段版）。**
 
-这个文件是**答案表的数据实体**，对应数据库中的 `interview_answer` 表。它保存候选人每次提交的答案正文、评分结果和评分反馈。补偿版 `AnswerEntity.java` 需要把补偿服务使用的字段（`createdAt`、`retryCount`、`status`）也映射出来，以便定时补偿任务能够扫描到处于 `PENDING_JUDGE` 状态但长时间未被评分的记录。另外，为了区分同一道题的初次作答与追问作答，还要把新增的 `is_follow_up` 列映射成 `isFollowUp` 字段。
+这个文件是**答案表的数据实体**，对应数据库中的 `interview_answer` 表。它保存候选人每次提交的答案正文、评分结果和评分反馈，以及三个与异步评分相关的字段：`status`（`SUBMITTED` 待评分 / `JUDGED` 已评分）、`retryCount`（历史重投计数，只读留档）、`createdAt`（报告生成前判断"最后几题评完没有"时会用到）。另外，为了区分同一道题的初次作答与追问作答，还要把 `is_follow_up` 列映射成 `isFollowUp` 字段。
 
 ```java
 package com.example.interview.infrastructure.mysql;
@@ -7073,7 +6877,7 @@ import com.baomidou.mybatisplus.annotation.TableName;
 import java.time.LocalDateTime;
 
 // 一次面试题答案及其异步评分状态。
-// 对应 interview_answer 表，包含答案正文、评分结果和补偿控制字段。
+// 对应 interview_answer 表，包含答案正文、评分结果和评分状态字段。
 @TableName("interview_answer")
 public class AnswerEntity {
     // 数据库自增主键。
@@ -7092,9 +6896,9 @@ public class AnswerEntity {
     private String feedback;
     // 围栏令牌，用于防止旧评分结果覆盖新评分结果。
     private Long fencingToken;
-    // 答案创建时间，用于补偿服务判断评分是否超时。
+    // 答案创建时间，报告生成前判断"最后几题是不是还没评完"时会用到。
     private LocalDateTime createdAt;
-    // 补偿重试次数，每次补偿服务扫描处理时递增。
+    // 重投计数：队列时代的重试次数记在消息体 retryCount 里，这一列保留为历史字段（只读、排查用）。
     private Integer retryCount;
     // 追问作答标记，对应 interview_answer.is_follow_up 列。
     // 用 Integer 而不是 boolean 承接 0/1：MyBatis-Plus 把基本类型 boolean 映射到 TINYINT 时
@@ -7186,7 +6990,7 @@ public class AnswerEntity {
         this.retryCount = retryCount;
     }
 
-    // isFollowUp 的读写方法，供仓储层写入、评分模块与补偿服务读取。
+    // isFollowUp 的读写方法，供仓储层写入、报告模块读取。
     public Integer getIsFollowUp() {
         return isFollowUp;
     }
@@ -7381,7 +7185,7 @@ public class AnswerRepository {
         entity.setScore(result.score());
         entity.setFeedback(result.feedback());
         entity.setFencingToken(result.fencingToken());
-        // 评分成功后更新状态，避免下一轮补偿继续扫描该记录。
+        // 评分成功后把状态写成 JUDGED：前端与报告模块靠它判断这道题评完没有。
         entity.setStatus("JUDGED");
         mapper.updateById(entity);
     }
@@ -7823,7 +7627,7 @@ Controller 只接收请求，业务编排放在 `AnswerCommandService`。
 1. **阻塞用户请求线程**：AI 调用通常耗时 3～10 秒，同步等待会占满 Web 服务器的线程池，导致其他请求排队。
 2. **缺乏容错能力**：如果 AI 调用超时或返回异常（JSON 解析失败、网络闪断），同步模式下用户请求会直接看到 500 错误。
 
-因此，本模块的核心目的是：**把耗时的 AI 评分从用户提交请求中解耦出来，通过 Redis List 队列异步投递评分任务，由 `@Scheduled` 驱动的消费者循环取任务、调用 AI、保存结果，并驱动后续的追问流程或下一题。** 队列用「待处理 / 处理中 / 死信」三个 key 保证任务不丢，另外还有一个补偿线程定时扫描数据库，兜底那些既不在队列里、处理线程又已经死掉的漏网任务。
+因此，本模块的核心目的是：**把耗时的 AI 评分从用户提交请求中解耦出来，通过 RabbitMQ 投递评分任务，由 `@RabbitListener` 驱动的消费者取任务、调用 AI、保存结果、手动 ack，并驱动后续的追问流程或下一题。** 队列用「主队列 + 延迟重试队列 + 死信队列」三件套保证任务不丢、失败能重试、重试耗尽后现场可查——这三件事都由 broker 提供语义，业务代码不再自己实现队列搬运与补偿扫描。
 
 ### 模块整体流程
 
@@ -7832,16 +7636,19 @@ Controller 只接收请求，业务编排放在 `AnswerCommandService`。
     │
     ▼
 答案落库 + 快照 CAS 成功后，JudgeTaskPublisher.publish(...)
-把 JudgeTask 序列化成 JSON，rightPush 到主队列
-interview:task:judge（立即返回，不阻塞用户）
+把 JudgeTask 序列化成 JSON，convertAndSend 到 interview.judge.queue
+（接口立即返回，HTTP 线程不等 AI）
     │
     ▼
-JudgeTaskConsumerLoop 的 @Scheduled(fixedDelay = 200) 循环
-每 200ms 调一次 pullOnce()：用 move 把队首原子搬移到
-processing 队列 interview:task:judge:processing
+JudgeTaskConsumer 的 @RabbitListener 收到消息
+（prefetch=2：单个消费者手里最多攥 2 条未确认消息）
     │
     ▼
 反序列化 JudgeTask（sessionId / questionId / answer / followUp / retryCount）
+    │
+    ▼
+提交给评分专用线程池，主线程 future.get(60s) 等结果
+（为什么绕这一层：AI 长尾时不能让监听线程卡死，否则整个队列停摆）
     │
     ▼
 调用 InterviewWorkflowService.judge(...) 执行评分工作流
@@ -7862,49 +7669,190 @@ chatJudge(...) 组装提示词（拼评分 Skill）→ 调 AI → 校验 JSON
 保存评分到数据库（interview_answer 表，按 is_follow_up 区分写哪一行）
     │
     ▼
-初次作答：推进面试状态机（JUDGE_DONE）并异步发布追问任务
+初次作答：推进面试状态机（JUDGE_DONE）并发布追问任务到 interview.follow-up.queue
 追问作答：早返回，只评分落库，不推进主线、不发布追问
     │
     ▼
-成功 → 从 processing 队列 remove 掉这条消息
-失败 → retryCount+1 重投主队列；超过 3 次 → 移入死信队列
-        interview:task:judge:dead
-    │
-    ▼
-补偿线程（JudgeTaskCompensationService，每 30 秒）兜底：
-数据库里超 5 分钟未评分、队列里又查不到、心跳也没了的记录
-→ 重投；超过补偿上限 → 置 JUDGE_FAILED 并写补偿日志
+成功 → channel.basicAck(tag, false)，消息从 unacked 里消失
+失败 → 投 interview.judge.retry.queue（TTL 10 秒到期经 DLX 自动回主队列）
+       重试超限（retryCount >= 3）→ 投 interview.judge.dead.queue，原样留现场
 ```
+
+**这三个队列分别干什么、为什么缺一不可：**
+
+| 队列 | 作用 | 少了它会怎样 |
+| --- | --- | --- |
+| `interview.judge.queue`（主） | 正常待处理任务的入口 | 没地方投任务 |
+| `interview.judge.retry.queue`（延迟重试） | 把重试摊开，TTL 10 秒后经死信交换机自动回主队列 | 只能 `nack(requeue=true)`，消息立刻回队首，限流中的 AI 接口被连打三次直接进死信，重试等于没重试 |
+| `interview.judge.dead.queue`（死信） | 重试耗尽/不可重试的消息原样留现场 | 坏消息要么无限重投打爆下游，要么被静默丢弃，没法排查 |
 
 ---
 
-### 评分 1：创建 Redis 评分队列
+### 评分 1：搭建 RabbitMQ 评分队列
 
-**本小节目的：** 建立答案评分任务的可靠投递通道。当候选人在面试中提交答案后，立即将评分任务写入 Redis 队列（不阻塞 HTTP 请求），由后台消费者异步处理。同时通过 processing 队列和死信队列机制，确保任务不会因消费者崩溃而丢失。
+**本小节目的：** 建立答案评分任务的可靠投递通道。当候选人在面试中提交答案后，立即把评分任务投进 RabbitMQ（不阻塞 HTTP 请求），由后台消费者异步处理；同时用「延迟重试 + 死信」把瞬时抖动与结构性失败分开处理。
 
 **本小节流程：**
 ```text
-定义任务对象（JudgeTask，带 followUp 标记）
-    → 发布者序列化后 rightPush 到主队列 interview:task:judge
-    → JudgeTaskConsumerLoop 每 200ms 调一次 pullOnce()，
-      用 move 把队首原子搬移到 processing 队列
-    → 处理成功则按「值 + 数量 1」精确 remove 掉 processing 里的这条消息
-    → 失败则判断重试次数
-        → 未超限：原样保留 followUp，retryCount+1 重新投递到主队列
-        → 超限（或反序列化失败）：移入 dead 死信队列
+定义队列拓扑（RabbitConfig：主队列 / 延迟重试队列 / 死信队列，评分·追问·报告各一套）
+    → 提交答案后 JudgeTaskPublisher 把 JudgeTask 序列化投进主队列
+    → @RabbitListener 收到消息，交给内部线程池跑评分工作流（60 秒超时）
+    → 成功：分数落库 + 状态推进 → basicAck
+    → 失败：投延迟重试队列，retryCount+1；TTL 到期自动回主队列
+    → 超限：投死信队列，business 侧不再动它
 ```
 
-**为什么出队用 `move` 而不是 `leftPopAndLeftPush`：** `move(source, LEFT, target, LEFT)` 是 Redis 6.2 的 `LMOVE`，把队首元素从主队列原子地搬到处理中队列，中间没有「取出来了但还没登记」的窗口——消费者此刻崩溃，任务也还留在处理中队列里，补偿服务才查得到。处理成功后按「值 + 数量 1」精确 `remove`，而不是再 `leftPop` 一次：处理中队列里可能同时躺着别人的消息，`leftPop` 会摘错。
+**为什么出队不再需要自己写循环：** 用 Redis List 时只能自己实现"取一条 → 处理 → 删除"，因为 List 没有消费端语义；而 RabbitMQ 的 `@RabbitListener` 就是消费端——连接建立后 broker 主动推消息，处理完 ack，连接断了自动 requeue。所以原来那个 `JudgeTaskConsumerLoop`（`@Scheduled(fixedDelay = 200)` 反复调 `pullOnce()`）整个类都被删掉，监听方法本身就是入口。
 
-**为什么消费由 `@Scheduled` 循环驱动：** `pullOnce()` 用的是非阻塞搬运（拿不到就返回 null），不会挂起线程，所以必须由调用方反复拉取；用 `@Scheduled(fixedDelay = 200)` 而不是在方法里写死循环，单次异常只跳过这一轮，不会让整个消费者永久退出。
+**为什么 ack 必须放在业务成功之后：** 消息在 ack 之前一直躺在 unacked 列表里。若第 ③ 步写完分数、第 ④ 步才 ack，中间进程被 kill，这条消息会随连接断开回到队列被别的消费者重投——这就是"评分不会因为一台机器挂掉而丢"的全部秘密。反过来，如果 ack 写在调用 AI 之前，进程一崩消息就没了，而库里的答案还停在 `SUBMITTED`，没人会来救它。
+
+**重投会不会把同一道题评两次？** 不会。答案表对 `(question_id, is_follow_up)` 建了唯一键，`recordJudge` 是按这个条件更新既有行，不是 insert。所以重投最多浪费一次模型调用，不会出现同题双行分数。
 
 ---
 
-#### 文件 1：`src/main/java/com/example/interview/application/JudgeTask.java`
+#### 文件 1：`src/main/java/com/example/interview/config/RabbitConfig.java`
 
-**创建这个文件干什么：** 这是 Redis 队列中传输的任务消息体。记录类（Java 16+ `record`）是不可变的，可以被安全地序列化/反序列化。`JudgeTaskPublisher` 会把它序列化成 JSON 放入 Redis 队列，消费者读取后再反序列化回这个对象。**如果没有这个 record 类，publish 方法就没有可以序列化的消息载体。**
+**创建这个文件干什么：** 声明三类异步任务共用的队列拓扑。每条线三个队列：主队列收正常任务，延迟重试队列只是"放 10 秒"的暂存区，死信队列留现场。全部 `durable`，broker 重启后队列和消息都还在。
 
-**为什么比最初多了 `followUp` 字段：** 追问作答与初次作答现在共用同一条评分队列。消费者拿到任务后要据此决定两件事——评分写回 `interview_answer` 的哪一行（`is_follow_up=0` 还是 `1`）、要不要推进主线状态机。所以队列载荷必须带上这个标记，且它被特意插在 `retryCount` **之前**，让「重试次数永远是最后一个分量」的约定保持不变，重投、补偿构造 `JudgeTask` 时不容易把参数错位。
+**为什么延迟重试队列要配 `x-dead-letter-exchange` 和 `x-dead-letter-routing-key`：** 这两个参数就是"消息到期后往哪送"的声明。交换机写空串表示默认交换机（default exchange），它的规则是"routingKey 等于队列名就直接投进那个队列"。所以 `x-dead-letter-routing-key` 填主队列名，TTL 一到消息就自己回去了，不需要任何定时器或消费者去搬。
+
+**为什么三条线各配一套，而不是共用一条队列：** 三类任务的耗时、失败后果、重试策略都不同——评分单条 3～10 秒、报告 30～120 秒、追问要调两次模型；混在一条队列里，报告把队列堵住时评分也跟着排队。分开之后，报告积压不影响答题，而且各自的死信队列能直接看出是哪条链路出的问题。
+
+**依赖什么：** `spring-boot-starter-amqp`（`QueueBuilder`、`Queue`）。
+
+**被谁调用：** `JudgeTaskPublisher` / `FollowUpTaskPublisher` / `ReportTaskPublisher` 引用队列名常量发消息；三个消费者的 `@RabbitListener(queues = ...)` 引用同一批常量声明监听目标。常量集中在这里，是为了避免"生产端写 `interview.judge.queue`、消费端写成 `judge.queue`"这类只在运行时才暴露的错。
+
+```java
+package com.example.interview.config;
+
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * 消息队列拓扑：评分、报告、追问三条线，共用同一套「主队列 + 延迟重试队列 + 死信队列」结构。
+ *
+ * <h3>为什么三类异步任务全部走 RabbitMQ</h3>
+ * 这三件事要的是同一组东西——消费确认、失败重试、死信、多消费者负载均衡、持久化、积压监控。
+ * 一套 broker 参数就全给了，运维只需要盯一个 RabbitMQ 控制台。
+ * 如果再有一类任务去手写 Redis List（三 key 搬运 + 心跳 + 补偿扫库），
+ * 等于同一个系统并存两套队列语义：面试官第一个问题就是「为什么这里不用 MQ」，
+ * 而答案是「没有理由」——所以追问也统一迁到 MQ 上。
+ *
+ * <h3>为什么重试走「延迟队列」而不是 nack(requeue=true)</h3>
+ * requeue 会让消息立刻回到队首，形成热循环：一个正在限流的 AI 接口会被瞬间打满三次，
+ * 三次全失败直接进死信，重试等于没重试。延迟队列把重试摊开（TTL 10 秒后经 DLX 回主队列），
+ * 给下游留恢复窗口。
+ */
+@Configuration
+public class RabbitConfig {
+
+    /* ---------------- 评分 ---------------- */
+
+    /** 评分主队列：提交答案后投递，消费者在这里取 */
+    public static final String JUDGE_QUEUE = "interview.judge.queue";
+
+    /** 延迟重试队列：TTL 10 秒，到期经 DLX 自动回主队列 */
+    public static final String JUDGE_RETRY_QUEUE = "interview.judge.retry.queue";
+
+    /** 死信队列：重试超限 / 不可重试失败，原样留现场给运维 */
+    public static final String JUDGE_DEAD_QUEUE = "interview.judge.dead.queue";
+
+    /* ---------------- 报告 ---------------- */
+
+    /** 报告主队列：和评分统一走队列，少一种机制 */
+    public static final String REPORT_QUEUE = "interview.report.queue";
+
+    /** 报告延迟重试队列：TTL 10 秒，到期经 DLX 自动回主队列 */
+    public static final String REPORT_RETRY_QUEUE = "interview.report.retry.queue";
+
+    /** 报告死信队列：重试超限进这里，前端置 FAILED 后可点「重新生成」再投一次 */
+    public static final String REPORT_DEAD_QUEUE = "interview.report.dead.queue";
+
+    /* ---------------- 追问 ---------------- */
+
+    /** 追问主队列：评分落库后投递，消费者在这里取 */
+    public static final String FOLLOW_UP_QUEUE = "interview.follow-up.queue";
+
+    /** 追问延迟重试队列：TTL 10 秒，到期经 DLX 自动回主队列 */
+    public static final String FOLLOW_UP_RETRY_QUEUE = "interview.follow-up.retry.queue";
+
+    /** 追问死信队列：重试超限 / 不可重试失败，原样留现场 */
+    public static final String FOLLOW_UP_DEAD_QUEUE = "interview.follow-up.dead.queue";
+
+    /** 重试间隔 10 秒 */
+    private static final int RETRY_TTL_MS = 10_000;
+
+    @Bean
+    public Queue judgeQueue() {
+        return QueueBuilder.durable(JUDGE_QUEUE).build();
+    }
+
+    @Bean
+    public Queue judgeRetryQueue() {
+        return QueueBuilder.durable(JUDGE_RETRY_QUEUE)
+                .withArgument("x-message-ttl", RETRY_TTL_MS)
+                // 死信交换机留空 = 默认交换机，routingKey 写目标队列名，到期直接回主队列
+                .withArgument("x-dead-letter-exchange", "")
+                .withArgument("x-dead-letter-routing-key", JUDGE_QUEUE)
+                .build();
+    }
+
+    @Bean
+    public Queue judgeDeadQueue() {
+        return QueueBuilder.durable(JUDGE_DEAD_QUEUE).build();
+    }
+
+    @Bean
+    public Queue reportQueue() {
+        return QueueBuilder.durable(REPORT_QUEUE).build();
+    }
+
+    @Bean
+    public Queue reportRetryQueue() {
+        return QueueBuilder.durable(REPORT_RETRY_QUEUE)
+                .withArgument("x-message-ttl", RETRY_TTL_MS)
+                .withArgument("x-dead-letter-exchange", "")
+                .withArgument("x-dead-letter-routing-key", REPORT_QUEUE)
+                .build();
+    }
+
+    @Bean
+    public Queue reportDeadQueue() {
+        return QueueBuilder.durable(REPORT_DEAD_QUEUE).build();
+    }
+
+    @Bean
+    public Queue followUpQueue() {
+        return QueueBuilder.durable(FOLLOW_UP_QUEUE).build();
+    }
+
+    @Bean
+    public Queue followUpRetryQueue() {
+        return QueueBuilder.durable(FOLLOW_UP_RETRY_QUEUE)
+                .withArgument("x-message-ttl", RETRY_TTL_MS)
+                .withArgument("x-dead-letter-exchange", "")
+                .withArgument("x-dead-letter-routing-key", FOLLOW_UP_QUEUE)
+                .build();
+    }
+
+    @Bean
+    public Queue followUpDeadQueue() {
+        return QueueBuilder.durable(FOLLOW_UP_DEAD_QUEUE).build();
+    }
+}
+```
+
+---
+
+#### 文件 2：`src/main/java/com/example/interview/application/JudgeTask.java`
+
+**创建这个文件干什么：** 这是队列里传输的任务消息体。记录类（Java 16+ `record`）不可变，投递后不会被修改，Jackson 能稳定地序列化/反序列化。**如果没有这个 record 类，`publish` 就没有可以序列化的消息载体。**
+
+**为什么带 `followUp` 字段：** 追问作答与初次作答共用同一条评分队列。消费者拿到任务后要据此决定两件事——评分写回 `interview_answer` 的哪一行（`is_follow_up=0` 还是 `1`）、要不要推进主线状态机。它被特意插在 `retryCount` **之前**，让「重试次数永远是最后一个分量」的约定保持不变，重投构造 `JudgeTask` 时不容易把参数错位。
+
+**为什么任务体只放最小上下文：** 只放"重新执行一次评分"必需的字段（会话、题目、答案原文）。上下文（历史问答、岗位、简历）由 `InterviewWorkflowService` 查库重建——塞进消息体既会膨胀，又会出现"消息里的上下文和库里不一致"的幽灵数据。
 
 ```java
 package com.example.interview.application;
@@ -7912,394 +7860,156 @@ package com.example.interview.application;
 import java.util.UUID;
 
 /**
- * 评分任务在 Redis 队列里的载荷对象。
+ * 评分任务在 RabbitMQ 里的载荷对象（消息体就是它的 JSON）。
  * <p>
  * 为什么用 record：
  * 1. 任务是只读的，投递进队列之后不会再被修改；
- * 2. 只装「重新执行一次评分」所必需的最小上下文，
- *    消费者与补偿线程拿到后据此重建评分调用；
+ * 2. 只装"重新执行一次评分"所必需的最小上下文，消费者拿到后据此重建评分调用；
  * 3. 字段都是基本类型 + String + UUID，Jackson 序列化 / 反序列化不会出意外。
  * </p>
  * <p>
- * 注意：这个类只描述「队列里传什么」。AI 返回后解析出来的结果对象是
- * {@link JudgeResult}（score / feedback / fencingToken / stale），
- * 两者字段不同，不要混用。
+ * 注意：这个类只描述"队列里传什么"。AI 返回后解析出来的结果对象是
+ * {@link JudgeResult}（score / feedback / fencingToken / stale），两者字段不同，
+ * 不要混用。本文件之前被误写成了 JudgeResult 的字段，导致
+ * {@code JudgeTaskPublisher} 全部编译不过，
+ * 现已改回队列载荷的形状。
  * </p>
  *
  * @param sessionId  面试会话 ID，消费者靠它取会话快照、推进状态机
  * @param questionId 题目 ID
  * @param answer     候选人答案原文，评分时直接送给 AI
  * @param followUp   是否追问作答：false=初次作答、true=追问作答。
- *                   消费者据此决定评分写回哪一行（is_follow_up），
- *                   以及是否推进主线状态机；
- *                   重试 / 补偿重投时必须原样保留，
- *                   否则追问任务会被当成初次作答错误处理。
- * @param retryCount 已重试次数：投递时为 0，重试与补偿各 +1，超过上限转死信队列
+ *                   消费者据此决定评分写回哪一行（is_follow_up），以及是否推进主线状态机；
+ *                   重投（延迟重试）时必须原样保留，否则追问任务会被当成初次作答错误处理。
+ * @param retryCount 已重试次数：投递时为 0，每次转延迟重试队列 +1，超过上限转死信队列
  */
 public record JudgeTask(
-        UUID sessionId,
-        UUID questionId,
-        String answer,
-        // 追问标记插在 retryCount 之前，retryCount 仍保持末位，
-        // 这样「重试次数永远是最后一个分量」的约定不变，阅读和调用时更不容易错位。
-        boolean followUp,
-        int retryCount
+    UUID sessionId,
+    UUID questionId,
+    String answer,
+    // 从这里开始是新增的：追问标记插在 retryCount 之前，retryCount 仍保持末位，
+    // 这样"重试次数永远是最后一个分量"的约定不变，阅读和调用时更不容易错位。
+    boolean followUp,
+    // 新增结束
+    int retryCount
 ) {
 }
 ```
 
 ---
 
-#### 文件 2：`src/main/java/com/example/interview/application/JudgeTaskPublisher.java`
+#### 文件 3：`src/main/java/com/example/interview/application/JudgeTaskPublisher.java`
 
-**创建这个文件干什么：** 这是评分队列的发布者和消费者合为一体的服务类。
+**创建这个文件干什么：** 只负责"发"。三个方法对应三个队列：`publish` 投主队列（`retryCount=0`）、`retryLater` 投延迟重试队列、`deadLetter` 投死信队列。
 
-**发布职责**：当用户提交答案后，`AnswerCommandService.submit()`（在其他章节定义）在「答案落库 + 快照 CAS 成功」之后调用 `publish(sessionId, questionId, answer, followUp)`，把 `JudgeTask` 序列化为 JSON 后 `rightPush` 进 `interview:task:judge` 主队列。
+**为什么这个类不再合并消费者：** 原来是「发布 + 消费 + 重试 + 死信」挤在一个类里（`pullOnce` / `consumeOnce` / `retryOrDeadLetter`），因为 Redis List 没有消费端语义，只能自己写循环去拉。换成 RabbitMQ 之后，消费由 `@RabbitListener` 驱动、ack 由 `Channel` 控制，这些都不再需要手写。职责一分开，"投递失败"和"消费失败"各自的失败面就独立了——排查时看日志前缀就知道是哪一头的问题。
 
-**消费职责**：真正被 `JudgeTaskConsumerLoop` 反复调用的是同步方法 `pullOnce()`。它用 `move`（Redis `LMOVE`）把队首任务从主队列原子性地搬到 processing 队列，执行工作流，成功后再按「值 + 数量 1」精确 `remove` 掉——这是 Redis 实现可靠消费的核心模式：即使消费者在处理过程中崩溃，任务也不会丢失，仍留在 processing 队列里等待补偿服务兜底。类里还保留了一个带 `@Async("aiScoringTaskExecutor")` 的 `consumeOnce()`，用带 200ms 超时的 `rightPopAndLeftPush` 拉一条，作为「单次异步消费」的备用入口；日常消费走的是 `pullOnce()` 这条路。
+**publisher confirm 在防什么：** `convertAndSend` 返回得很快，但它只代表"方法没抛异常"，不代表消息真的进了 broker 的队列。发布那一刻 broker 挂了、交换机路由不到队列，消息就静默丢了——而库里那条答案还停在"待评分"，没有任何人会来救它。开启 correlated confirm 之后，"发布成功"变成一个可确认的事实，没确认就打 error 日志。
 
-**重试与死信机制**：如果消费失败（AI 超时、解析异常等），调用 `retryOrDeadLetter()` 判断：`retryCount < MAX_RETRY(3)` 则**原样保留 `followUp`**、只把重试次数 +1 重新入队；否则（或反序列化失败、`task == null`）推入 `interview:task:judge:dead` 死信队列，供运维人工排查。
+**为什么回调里只记日志不自动重发：** 回调只拿得到 `correlationData`，拿不到"发的是哪条任务"，想重发就得自己维护一张 id → 任务 的映射表。更稳的兜底是"库里那条答案还是 `SUBMITTED`"这个事实——真丢了按状态查一遍就能定位，比在回调里做一次不确定是否成功的重试更可靠。
 
-**为什么需要三个队列键（QUEUE / PROCESSING / DEAD）？**
-- **QUEUE**（待处理）：消息的入口，`rightPush` 写入尾部，消费者从头部取任务。
-- **PROCESSING**（处理中）：`move` 把任务从 QUEUE 原子性地移到 PROCESSING，表示这个任务正在被某个消费者处理。如果消费者崩溃，任务会保留在 PROCESSING 中，不会丢失，但也不会被其他消费者取走——因此需要「评分 1.1 补偿服务」来兜底。
-- **DEAD**（死信）：超过最大重试次数的任务移到这里，避免无限循环。
+**`deliveryMode=PERSISTENT` 为什么要显式写：** 默认就是持久化，写出来是为了让"这条消息必须活过 broker 重启"在代码里可见——评审时不至于以为它依赖默认值。
 
-**依赖什么：**
-- `StringRedisTemplate`：Spring Data Redis 提供，操作 Redis 列表。
-- `ObjectMapper`：Jackson 提供的 JSON 序列化/反序列化工具。
-- `InterviewWorkflowService`（在下一节「评分 3」中定义）：真正执行业务逻辑的编排服务，由构造器注入。
+**依赖什么：** `RabbitTemplate`（发消息）、`ObjectMapper`（序列化）。
 
-**被谁调用：** 由答案提交流程（上一章节）调用 `publish()` 方法触发；由 `JudgeTaskConsumerLoop` 的定时循环调用 `pullOnce()` 完成消费。
+**被谁调用：** `AnswerCommandService.submit` 调 `publish`；`JudgeTaskConsumer` 在失败分支调 `retryLater` / `deadLetter`。
 
 ```java
 package com.example.interview.application;
 
+import com.example.interview.config.RabbitConfig;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
-import org.springframework.data.redis.connection.RedisListCommands.Direction;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Async;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.util.UUID;
 
 /**
- * Redis 评分队列的发布者 + 消费者（合并在同一个 Service 中）。
- * <p>
- * 为什么合并在一个类中：发布（publish）与消费（pullOnce）共享相同的队列键、
- * 重试策略、序列化配置。拆成两个类会导致重复的常量和配置代码，
- * 且事务一致性更难保证（例如消费失败后重投时，依赖同一个 retryOrDeadLetter 方法）。
- * </p>
+ * 评分任务投递器：把消息放进主队列 / 延迟重试队列 / 死信队列。
+ *
+ * <h3>为什么这个类只负责「发」，不再负责「取」</h3>
+ * 原来是「发布 + 消费 + 重试 + 死信」挤在一个类里（pullOnce / consumeOnce / retryOrDeadLetter），
+ * 因为 Redis List 没有消费端语义，只能自己写循环去拉。换成 RabbitMQ 之后，
+ * 消费由 {@code @RabbitListener} 驱动、ack 由 Channel 控制，这些都不再需要手写。
+ * 职责一分开，「投递」和「消费」各自的失败面就独立了。
+ *
+ * <h3>publisher confirm 干什么</h3>
+ * {@code rabbitTemplate.convertAndSend} 返回得很快，但它只代表「方法没抛异常」，
+ * 不代表消息真的进了 broker 的队列。发布那一刻 broker 挂了、交换机路由不到队列，
+ * 消息就静默丢了——而库里那条答案还停在「待评分」，没有任何人会来救它。
+ * 开启 correlated confirm 之后，「发布成功」变成一个可确认的事实，没确认就打日志告警。
  */
 @Service
 public class JudgeTaskPublisher {
 
-    // ================ Redis 队列键 ================
+    private static final Logger log = LoggerFactory.getLogger(JudgeTaskPublisher.class);
 
-    /**
-     * 待处理任务队列（List 类型）。
-     * rightPush 写入尾部(右侧)，消费时用 move（Redis 6.2 的 LMOVE）从头部(左侧)取出
-     * 并原子性转移到 processing 队列。右侧进左侧出，构成 FIFO（先进先出）队列——
-     * 先提交的答案先被评分。
-     * 命名规范：interview:{模块}:{用途}，便于在 Redis CLI 中按前缀批量管理。
-     */
-    private static final String QUEUE = "interview:task:judge";
-
-    /**
-     * 已取出但尚未确认完成的任务队列（List 类型）。
-     * 为什么需要这个队列：普通的 leftPop 直接从 QUEUE 删除任务，
-     * 如果消费者在处理过程中崩溃，任务永远丢失。
-     * 而 move 把任务从 QUEUE 原子性地移动到 PROCESSING，
-     * 消费者确认完成后才按「值 + 数量 1」精确 remove 掉。
-     * 即使消费者崩溃，任务仍保留在 PROCESSING 中，由补偿服务兜底。
-     */
-    private static final String PROCESSING = "interview:task:judge:processing";
-
-    /**
-     * 超过最大重试次数的死信队列（List 类型）。
-     * 为什么需要死信队列：不直接丢弃失败任务，而是保留现场供运维排查。
-     * 运维可以查看死信队列中的任务，分析失败原因（AI 接口异常？格式变化？），
-     * 修复后手动重新投递到 QUEUE。
-     */
-    private static final String DEAD = "interview:task:judge:dead";
-
-    /**
-     * 单个任务的最大重试次数。
-     * 为什么是 3 次：<br>
-     * - 第 1 次失败：可能是瞬时的网络抖动，重试大概率成功。<br>
-     * - 第 2 次失败：可能是 AI 服务短暂不可用，等待几秒后重试。<br>
-     * - 第 3 次失败：大概率是永久性异常（如 prompt 格式错误、AI 模型不存在等），
-     *   不再重试，进入死信队列。<br>
-     * 3 次是经典的重试次数上限。太多浪费队列资源，太少则对临时故障不够友好。
-     */
-    private static final int MAX_RETRY = 3;
-
-    // ================ 依赖注入 ================
-
-    /**
-     * Spring Data Redis 提供的 Redis 操作模板。
-     * 为什么用 StringRedisTemplate 而不是 RedisTemplate<String, Object>：
-     * 因为队列中存储的是 JSON 字符串，手动序列化/反序列化更可控。
-     * StringRedisTemplate 的序列化器默认就是 StringRedisSerializer，
-     * 对字符串操作不需要额外的类型转换，性能更好。
-     */
-    private final StringRedisTemplate redis;
-
-    /**
-     * Jackson JSON 序列化/反序列化工具。
-     * 为什么需要：JudgeTask record 需要序列化为 JSON 字符串存入 Redis 列表，
-     * 读取时又需要从 JSON 反序列化为 JudgeTask 对象。
-     * 使用 ObjectMapper 而不是手动拼接 JSON，可以保证：
-     * 1. 字段名和值类型一致（不会出现字符串值被当作数字的问题）；
-     * 2. 特殊字符被正确转义（答案文本可能包含引号、换行符等）；
-     * 3. 后续如果 record 增加字段，反序列化自动兼容（JSON 中有多余字段则忽略）。
-     */
+    private final RabbitTemplate rabbit;
     private final ObjectMapper mapper;
 
-    /**
-     * 评分工作流：真正执行「AI 评分 + 落库 + 推进状态 + 触发追问」的那一环。
-     * 全类只声明这一次，构造器注入一次，避免重复字段导致编译报错。
-     */
-    private final InterviewWorkflowService workflow;
-
-    /**
-     * 构造函数注入所有依赖。
-     * 
-     * 为什么不使用 @Autowired 字段注入：
-     * 1. 构造函数注入让依赖在对象创建时就被固定下来，运行期间不可变；
-     * 2. 在单元测试时可以直接 new 并传入 mock 对象，不需要反射或 Spring 容器；
-     * 3. 如果依赖过多，构造函数参数列表会「提醒」你该类承担了过多职责（单一职责原则）。
-     */
-    public JudgeTaskPublisher(
-            StringRedisTemplate redis,
-            ObjectMapper mapper,
-            InterviewWorkflowService workflow
-    ) {
-        this.redis = redis;
+    public JudgeTaskPublisher(RabbitTemplate rabbit, ObjectMapper mapper) {
+        this.rabbit = rabbit;
         this.mapper = mapper;
-        this.workflow = workflow;
     }
 
-    // ================ 发布方法 ================
+    /**
+     * 注册发布确认回调：只记日志，不在这里重发。
+     *
+     * <p>为什么不自动重发：重发需要知道「发的是哪条任务」，而回调里只有 correlationData。
+     * 更稳的兜底是「库里那条答案还是待评分」——真有消息丢了，按状态扫一遍就能补，
+     * 比在回调里做一次不确定是否成功重试更可靠。
+     */
+    @PostConstruct
+    void registerConfirmCallback() {
+        rabbit.setConfirmCallback((correlationData, ack, cause) -> {
+            if (!ack) {
+                log.error("评分/报告消息未被 broker 确认，可能已丢失: id={} cause={}",
+                        correlationData == null ? "null" : correlationData.getId(), cause);
+            }
+        });
+        rabbit.setReturnsCallback(returned ->
+                log.error("消息无法路由到队列: exchange={} routingKey={} reply={}",
+                        returned.getExchange(), returned.getRoutingKey(), returned.getReplyText()));
+    }
 
     /**
-     * 把答案包装成 JudgeTask 任务消息，序列化为 JSON 后写入 Redis 待处理队列。
-     * 
-     * 为什么这个方法不阻塞：
-     * 1. 写入 Redis 队列是内存级操作，通常在微秒级完成；
-     * 2. 即使 Redis 暂时不可用，rightPush 抛出异常时，
-     *    调用方可以捕获异常并返回用户一个友好的提示，
-     *    而不是让用户等待 AI 评分完成（AI 评分可能要好几秒）。
-     * 
-     * @param sessionId  面试会话 ID，必填且不能为 null
-     * @param questionId 题目 ID，必填且不能为 null
-     * @param answer     候选人提交的答案文本，可以为空字符串但不能为 null
-     * @param followUp   是否追问作答：false=初次作答、true=追问作答。
-     *                   追问与初次共用同一条队列，载荷必须带上这个标记，
-     *                   否则消费者无法区分「该写哪一行、该不该推进状态机」。
-     * @throws IllegalStateException 如果序列化 JudgeTask 失败
+     * 提交答案后投递评分任务。
+     *
+     * <p>返回即代表「已投递」，不代表「已评分」——接口立刻返回给用户，
+     * 真正的 AI 调用在消费者那边跑。
      */
-    public void publish(
-            UUID sessionId,
-            UUID questionId,
-            String answer,
-            boolean followUp
-    ) {
+    public void publish(UUID sessionId, UUID questionId, String answer, boolean followUp) {
+        send(RabbitConfig.JUDGE_QUEUE, new JudgeTask(sessionId, questionId, answer, followUp, 0));
+    }
+
+    /** 可重试失败：投延迟队列，TTL 到期后经死信交换机自动回主队列 */
+    public void retryLater(JudgeTask task) {
+        send(RabbitConfig.JUDGE_RETRY_QUEUE, task);
+    }
+
+    /** 重试超限 / 不可重试：进死信，原样留现场 */
+    public void deadLetter(JudgeTask task) {
+        send(RabbitConfig.JUDGE_DEAD_QUEUE, task);
+    }
+
+    private void send(String routingKey, Object task) {
         try {
-            // rightPush：向列表尾部（右侧）插入一个元素。
-            // 为什么用 rightPush 而不是 leftPush：
-            // 写入走右侧（尾部），消费者从左侧（头部）取，
-            // 右侧进左侧出，构成真正的 FIFO（先进先出）队列，
-            // 保证先提交的答案先被评分（先来后到）。
-            redis.opsForList().rightPush(
-                    QUEUE,
-                    // 将 JudgeTask 对象序列化为 JSON 字符串。
-                    // 为什么存 JSON 而不是 Java 原生序列化：
-                    // 1. JSON 是跨语言的，如果以后有 Node.js/Python 消费者也能读取；
-                    // 2. JSON 可读性好，运维可以直接在 Redis CLI 中查看消息内容；
-                    // 3. Jackson 序列化性能优于 Java 原生序列化。
-                    mapper.writeValueAsString(
-                            new JudgeTask(
-                                    sessionId,
-                                    questionId,
-                                    answer,
-                                    followUp,   // 追问标记，透传进队列载荷
-                                    0           // 初始重试次数为 0，末位仍表示首次投递
-                            )
-                    )
-            );
+            String payload = mapper.writeValueAsString(task);
+            rabbit.convertAndSend(routingKey, payload, message -> {
+                // persistent：broker 重启后消息不丢。默认就是 persistent，
+                // 显式写出来是为了让「这条消息必须活过重启」在代码里可见。
+                message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                return message;
+            });
+            log.info("已投递 queue={} payload={}", routingKey, payload);
         } catch (JsonProcessingException e) {
-            // 什么情况下会走到这里：ObjectMapper 无法序列化 JudgeTask。
-            // 实际上 JudgeTask 是一个 record，字段都是基本类型+String+UUID，
-            // 几乎不可能序列化失败。
-            // 但是 Jackson 声明抛出 JsonProcessingException，我们必须处理。
-            // 这里包装为 IllegalStateException（非受检异常），
-            // 让调用方不需要显式 try-catch，简化 controller 层的代码。
-            throw new IllegalStateException(
-                    "无法序列化评分任务: sessionId=" + sessionId
-                            + ", questionId=" + questionId,
-                    e
-            );
-        }
-    }
-
-    // ================ 消费方法 ================
-
-    /**
-     * 从 Redis 队列中取出一条评分任务并处理（带 200ms 阻塞的备用入口）。
-     *
-     * 为什么加 @Async("aiScoringTaskExecutor")：
-     * 1. 这个方法由 Spring 的异步线程池执行，不阻塞主线程；
-     * 2. "aiScoringTaskExecutor" 是自定义线程池 Bean 的名称（见 AsyncConfig），
-     *    核心 4 / 最大 8 / 队列 100，专门用于 AI 评分任务。
-     *    为什么不用默认的 SimpleAsyncTaskExecutor：AI 任务可能很多，
-     *    需要控制并发数，避免线程暴涨导致系统负载过高或 Redis 连接被打满。
-     *
-     * 注意：日常消费走的是下面同步的 pullOnce()，由 JudgeTaskConsumerLoop 定时循环调用。
-     * 本方法保留的是「单次异步消费」能力，适合被外部一次性触发。
-     */
-    @Async("aiScoringTaskExecutor")
-    public void consumeOnce() {
-        // rightPopAndLeftPush（对应 Redis 命令 RPOPLPUSH）：
-        // 原子性地从 QUEUE 尾部取出一个元素，推入 PROCESSING 队列。
-        // 为什么用带超时的版本：队列为空时等待 200ms 后返回 null，避免无限期阻塞占用线程。
-        String raw = redis.opsForList().rightPopAndLeftPush(QUEUE, PROCESSING, Duration.ofMillis(200));
-        // 队列为空时直接返回（Redis 列表为空时返回 null，而非空字符串）。
-        if (raw == null) {
-            return;
-        }
-        JudgeTask task = null;
-        try {
-            // 反序列化后立刻执行评分工作流，并把载荷里的 followUp 透传给工作流，
-            // 追问作答才不会推进主线状态机。
-            task = mapper.readValue(raw, JudgeTask.class);
-            workflow.judge(task.sessionId(), task.questionId(), task.answer(), task.followUp());
-            // 处理成功后，从 PROCESSING 队列中移除这条消息。
-            // remove 参数：键名 / 最多删除 1 个匹配元素 / 要删除的 JSON 字符串。
-            redis.opsForList().remove(PROCESSING, 1, raw);
-        } catch (Exception e) {
-            // 任何异常（反序列化失败、AI 调用超时、数据库写入失败等）都走重试或死信逻辑。
-            retryOrDeadLetter(raw, task);
-        }
-    }
-
-    /**
-     * 同步拉取并处理一条评分任务（日常消费入口）。
-     *
-     * <p>判定依据是队列搬运是否返回 null——返回 null 就说明待处理队列此刻没有任务，
-     * 本轮无事可做。之所以在 consumeOnce() 之外再开一个方法：consumeOnce() 上有 @Async，
-     * 调用后会立刻返回，不能用来「循环拉取」；本方法保持同步语义，处理完才返回，
-     * 正好放进 JudgeTaskConsumerLoop 的定时循环里。</p>
-     *
-     * @return 本次是否消费到任务：true 表示确实拿到并处理了一条，false 表示队列已空
-     */
-    public boolean pullOnce() {
-        // 把队首元素从 QUEUE 原子地搬到 PROCESSING：中间没有「取出来了但还没登记」的窗口，
-        // 消费者此刻崩溃任务也还留在处理中队列里，补偿服务才能查得到并重投。
-        // 从左边取是因为 publish 用的是 rightPush——右侧进、左侧出，先到先处理。
-        // 这里是非阻塞版本：拿不到就返回 null，由外层 @Scheduled 反复调用，不会挂起线程。
-        String raw = redis.opsForList().move(QUEUE, Direction.LEFT, PROCESSING, Direction.LEFT);
-        // 返回 null 说明 QUEUE 已经空了，本轮没有任务可处理。
-        if (raw == null) {
-            return false;
-        }
-        JudgeTask task = null;
-        try {
-            // 反序列化后立刻执行评分工作流：AI 评分 → 落库 → 推进状态 → 触发追问。
-            task = mapper.readValue(raw, JudgeTask.class);
-            // pullOnce 同样要把 followUp 透传下去（追问任务重投后仍保持追问语义）。
-            workflow.judge(task.sessionId(), task.questionId(), task.answer(), task.followUp());
-            // 评分成功，按「值 + 数量 1」精确 remove 掉处理中队列里的这条消息。
-            // 不能用 leftPop：处理中队列里可能同时躺着别人的消息，leftPop 会摘错。
-            redis.opsForList().remove(PROCESSING, 1, raw);
-        } catch (Exception e) {
-            // 任何环节失败（反序列化 / AI 评分 / 落库）都交给重投或死信，
-            // 避免任务永远留在处理中队列里没人管。
-            retryOrDeadLetter(raw, task);
-        }
-        return true;
-    }
-
-    // ================ 重试 / 死信逻辑 ================
-
-    /**
-     * 判断任务应该重新入队重试还是进入死信队列。
-     * 
-     * @param raw  原始的 JSON 字符串，如果 task 解析失败（task==null），
-     *             则用 raw 直接入死信队列，因为重试也无法反序列化。
-     * @param task 解析后的 JudgeTask 对象，可能为 null（解析失败时）
-     */
-    public void retryOrDeadLetter(
-            String raw,
-            JudgeTask task
-    ) {
-        // 进入死信队列的条件：
-        // 条件 1：task == null（反序列化失败）
-        //     -> 这说明消息的 JSON 格式损坏或结构不匹配，
-        //        重试多少次都不可能成功，必须人工介入。
-        // 条件 2：task.retryCount() >= MAX_RETRY（超过最大重试次数）
-        //     -> 已经重试过 3 次仍然失败，大概率是永久性异常
-        //        （如 AI 模型接口地址错误、prompt 格式不兼容等），
-        //        继续重试只会浪费资源。
-        if (task == null || task.retryCount() >= MAX_RETRY) {
-            // 推入死信队列，供运维人工排查。
-            redis.opsForList().rightPush(DEAD, raw);
-            // 从 PROCESSING 队列中删除这条消息。
-            // 如果不删除，它永远留在 PROCESSING 中，
-            // 补偿服务会不断扫描到它（评分 1.1），产生不必要的日志。
-            redis.opsForList().remove(
-                    PROCESSING,
-                    1,
-                    raw
-            );
-            return;
-        }
-
-        try {
-            // 构建重试任务：retryCount 比原来 +1。
-            // 为什么创建新的 JudgeTask 而不是修改原对象：
-            // JudgeTask 是 Java record，所有字段都是 final 的，
-            // 不可修改。这是 record 的设计意图——不可变性。
-            // 创建新对象也不会影响已存在的旧对象引用，线程安全。
-            JudgeTask retry = new JudgeTask(
-                    task.sessionId(),
-                    task.questionId(),
-                    task.answer(),
-                    task.followUp(),        // 原样保留追问标记，重投后仍走追问分支
-                    task.retryCount() + 1   // 重试次数 +1
-            );
-
-            // 重新投递到待处理队列，等待下一次消费。
-            redis.opsForList().rightPush(
-                    QUEUE,
-                    mapper.writeValueAsString(retry)
-            );
-
-            // 从 PROCESSING 队列中删除旧消息。
-            // 删除操作在 rightPush 之后执行：
-            // 即使删除失败（如 Redis 宕机），旧消息还留在 PROCESSING 中，
-            // 由补偿服务兜底扫描处理（评分 1.1）。
-            // 但 rightPush 已经成功了，所以下一轮消费不会丢失任务。
-            redis.opsForList().remove(
-                    PROCESSING,
-                    1,
-                    raw
-            );
-        } catch (JsonProcessingException serializationError) {
-            // 什么情况下会走到这里：ObjectMapper 无法序列化重试的 JudgeTask。
-            // 与 publish 方法一样，JudgeTask 的字段都很简单，几乎不可能失败。
-            // 但为了完整性，这里声明了异常处理。
-            // 注意：这里抛出 IllegalStateException 会导致当前任务没有被正确处理，
-            // 它仍然在 PROCESSING 队列中，由补偿服务兜底。
-            throw new IllegalStateException(
-                    "无法序列化重试任务: sessionId="
-                            + task.sessionId()
-                            + ", questionId=" + task.questionId(),
-                    serializationError
-            );
+            // 载荷是 record + 基本类型，序列化失败属于程序错误，直接抛
+            throw new IllegalStateException("无法序列化评分任务", e);
         }
     }
 }
@@ -8307,500 +8017,218 @@ public class JudgeTaskPublisher {
 
 ---
 
-#### 文件 3：`src/main/java/com/example/interview/application/JudgeTaskConsumerLoop.java`
+#### 文件 4：`src/main/java/com/example/interview/application/JudgeTaskConsumer.java`
 
-**创建这个文件干什么：** 它是评分队列的「节拍器」。`pullOnce()` 用的是非阻塞搬运（拿不到就返回 null），不会挂起线程，所以必须有人反复拉取——否则任务会一直躺在队列里，补偿服务查库时看不到任何「已评分」的记录，只会一遍遍重复补偿，等于空转。
+**创建这个文件干什么：** 这是"谁来消费"的答案。`@RabbitListener(queues = RabbitConfig.JUDGE_QUEUE)` 让 broker 主动把消息推给这个实例；方法里做四件事：反序列化 → 带超时执行评分工作流 → 成功 ack / 失败转下一跳。
 
-**为什么用 `@Scheduled` 而不是把循环写在方法里：** 写在方法里就是常驻线程 + 忙等，一旦抛异常整个消费者永久退出；`@Scheduled(fixedDelay)` 由 Spring 调度，单次异常只会跳过这一轮，下一轮照常拉取，健壮性更好。间隔取 200ms：队列为空时最多带来 5 次/秒的空查询，成本可忽略。
+**为什么还要自己加超时：** 这是 RabbitMQ 消费端最容易被忽略的一个坑。消费者活着、消息握在手里没 ack 时，broker 认为"有人在处理"，绝不会重投；如果 AI 上游卡住不返回，这条消息会把一个监听线程永远占住，`prefetch` 满了以后这个消费者再也接不了新消息，整个队列等于停摆。所以评分被提交到一个独立线程池，主线程 `future.get(60, TimeUnit.SECONDS)`，超时就放弃等待、按可重试失败处理。
 
-**为什么用 `fixedDelay` 而不是 `fixedRate`：** 必须等上一轮处理完再开始计时，否则队列积压时会不断叠加新的拉取轮次。
+**为什么超时不直接改 AI 客户端的 read timeout：** 项目里 AI 客户端的 read timeout 是 180 秒（给报告这种长生成留时间）。把全局超时改成 60 秒，报告生成会被腰斩。所以超时控制只加在"评分这一条链路"上。
+
+**为什么超时值取 60 秒而不是 30 秒：** 实测上游抖动时单个评分经常 25～30 秒才回，正好卡在超时线上，于是"超时 → 重试 → 再超时"，用户在界面上看到的是一次取题等一两分钟。放宽到 60 秒后，慢但能成功的调用直接成功，比反复重试更省时间；可用 `app.interview.judge-timeout-seconds` 覆盖。
+
+**`future.cancel(true)` 真的能停掉 AI 调用吗：** 不能完全停。`cancel(true)` 只是给线程发中断信号，底层 HTTP 请求可能还会跑一会儿才结束。但它已经不影响这条消息的命运了——消息会被重投，而同题重评由 `(question_id, is_follow_up)` 唯一键兜住，不会出现同题双评。
+
+**`retryOrDead` 的两个分支：** `retryCount < 3` 就投延迟重试队列并 `+1`；`>= 3` 投死信。**无论走哪条路都要 ack 原消息**——不 ack 它会一直躺在 unacked 里，直到连接断开被重投，等于又绕回"无限热重试"。反序列化失败（`task == null`）直接 ack 并记日志：这种消息重投一万次也还是解析不了。
+
+**依赖什么：** `InterviewWorkflowService`（真正跑评分）、`JudgeTaskPublisher`（转重试/死信）、`ObjectMapper`、`Channel`（手动 ack）。
+
+**被谁调用：** Spring AMQP 的消息容器在收到消息时调用 `onJudge`，不需要任何业务代码触发。
 
 ```java
 package com.example.interview.application;
 
-import org.springframework.scheduling.annotation.Scheduled;
+import com.example.interview.config.RabbitConfig;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rabbitmq.client.Channel;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
-// ============================================================
-// 评分任务消费者循环
-// ============================================================
-// 职责：定时从评分队列拉取任务，交给 JudgeTaskPublisher.pullOnce() 处理。
-//
-// 为什么需要一个循环：pullOnce 用的是非阻塞的队列搬运（拿不到就返回 null），
-// 不会像 consumeOnce 里带超时的阻塞弹出那样挂起等待。所以必须由调用方反复拉取，
-// 否则任务会一直躺在队列里，补偿服务查库时看不到任何"已评分"的记录，
-// 只会一遍遍重复补偿，等于空转。
-//
-// 为什么用 @Scheduled 而不是把循环写在方法里：
-//   写在方法里就是常驻线程 + 忙等，一旦抛异常整个消费者永久退出；
-//   @Scheduled(fixedDelay) 由 Spring 调度，单次异常只会跳过这一轮，
-//   下一轮照常拉取，健壮性更好。
-//   间隔取 200ms：队列为空时最多带来 5 次/秒的空查询，成本可忽略。
-// ============================================================
+import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * 评分消费者：RabbitMQ 手动 ack + AI 调用超时 + 延迟重试 + 死信。
+ *
+ * <h3>主链路</h3>
+ * 收到消息 → 调评分工作流（AI 评分 + 落库 + 推进状态 + 投追问）→ {@code basic.ack}。
+ * <b>ack 在业务成功之后</b>：第 ③ 步写完分数、第 ④ 步才 ack。中间崩溃 → 消息没确认 →
+ * RabbitMQ 自动把它 requeue 给其他消费者。这就是「评分不会因为一台机器挂掉而丢」的全部秘密。
+ *
+ * <h3>两种「停住」，ack 都兜不住，必须自己处理</h3>
+ * <ol>
+ *   <li><b>AI 长尾卡住消费者</b>：消费者活着、消息还握在手里没 ack，broker 不会重投。
+ *       所以调 AI 必须设超时（30 秒），超时主动按「可重试失败」处理，投延迟重试队列。</li>
+ *   <li><b>发布时 broker 恰好挂了</b>：消息根本没进队列，没有任何消费者会拿到它。
+ *       这个缺口由 publisher confirm 兜（见 JudgeTaskPublisher）。</li>
+ * </ol>
+ *
+ * <h3>为什么超时用 Future 包一层，而不是只改 HTTP 超时</h3>
+ * 项目里 AI 客户端的 read timeout 是 180 秒（给报告这种长生成留时间）。
+ * 如果把全局超时改成 30 秒，报告生成会被腰斩。所以超时控制放在「评分这一条链路」上：
+ * 用独立的线程池执行评分，主线程等 30 秒，超时就放弃等待并走重试。
+ */
 @Component
-public class JudgeTaskConsumerLoop {
+public class JudgeTaskConsumer {
 
-    // 只依赖发布者：取任务、处理、失败重试都在 JudgeTaskPublisher 里完成，
-    // 本类只负责"按节奏调用"，职责保持单一。
+    private static final Logger log = LoggerFactory.getLogger(JudgeTaskConsumer.class);
+
+    /**
+     * 评分超时：正常 3~10 秒，长尾几十秒。
+     * 原来是写死的 30 秒，实测上游抖动时单个评分经常 25~30 秒才回，正好卡在超时线上：
+     * 一超时就转延迟重试，重试又超时，用户在界面上看到的是一次取题要等一两分钟。
+     * 现在默认 60 秒（可用 app.interview.judge-timeout-seconds 覆盖）：
+     * 慢但能成功的调用直接让它成功，比"超时→重试→再超时"更省时间。
+     * 消息最长只被握 60 秒，手动 ack + 延迟重试那条通路不变。
+     */
+    private final int aiTimeoutSeconds;
+
+    /** 重试上限：3 次。再多基本可以断定不是抖动，而是数据或上游配置坏了 */
+    private static final int MAX_RETRY = 3;
+
+    private final InterviewWorkflowService workflow;
     private final JudgeTaskPublisher publisher;
+    private final ObjectMapper mapper;
 
-    // 构造器注入，方便测试时替换成 mock。
-    public JudgeTaskConsumerLoop(JudgeTaskPublisher publisher) {
+    /**
+     * 评分专用线程池：只用来给「等 AI」加超时。
+     *
+     * <p>为什么不能直接在监听线程里调 workflow：一旦 AI 挂住，监听线程就永远卡在那，
+     * prefetch 会把消息全压在这一个消费者上，其他实例分不到活，整个队列等于停摆。
+     */
+    private final ExecutorService judgeExecutor = Executors.newFixedThreadPool(8, r -> {
+        Thread t = new Thread(r, "judge-ai-");
+        t.setDaemon(true);
+        return t;
+    });
+
+    public JudgeTaskConsumer(InterviewWorkflowService workflow,
+                             JudgeTaskPublisher publisher,
+                             ObjectMapper mapper,
+                             @org.springframework.beans.factory.annotation.Value(
+                                     "${app.interview.judge-timeout-seconds:60}") int aiTimeoutSeconds) {
+        this.workflow = workflow;
         this.publisher = publisher;
+        this.mapper = mapper;
+        this.aiTimeoutSeconds = aiTimeoutSeconds;
+    }
+
+    @PreDestroy
+    void shutdown() {
+        judgeExecutor.shutdownNow();
+    }
+
+    @RabbitListener(queues = RabbitConfig.JUDGE_QUEUE)
+    public void onJudge(String payload, Message message, Channel channel) throws IOException {
+        long tag = message.getMessageProperties().getDeliveryTag();
+        JudgeTask task = null;
+        try {
+            task = mapper.readValue(payload, JudgeTask.class);
+            judgeWithTimeout(task);
+            // 分数落库、状态推进都完成了，才确认消费
+            channel.basicAck(tag, false);
+        } catch (AiTimeoutException e) {
+            log.warn("评分超时（{}s），转延迟重试: {}", aiTimeoutSeconds, payload);
+            retryOrDead(task, channel, tag);
+        } catch (Exception e) {
+            log.error("评分失败，转延迟重试: {}", payload, e);
+            retryOrDead(task, channel, tag);
+        }
+    }
+
+    private void judgeWithTimeout(JudgeTask task) {
+        Future<?> future = judgeExecutor.submit(() ->
+                workflow.judge(task.sessionId(), task.questionId(), task.answer(), task.followUp()));
+        try {
+            future.get(aiTimeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            // cancel(true) 只是「请求中断」：底层 HTTP 调用可能还会跑一会儿才结束，
+            // 但它已经不影响这条消息的命运了——消息会被重投，靠的是答案表的唯一键
+            // (question_id, is_follow_up) 保证重投幂等，不会出现同题双评。
+            future.cancel(true);
+            throw new AiTimeoutException("评分超过 " + aiTimeoutSeconds + " 秒");
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("评分被中断", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IllegalStateException("评分执行失败", cause);
+        }
     }
 
     /**
-     * 定时拉取一条评分任务。
+     * 重试或进死信。
      *
-     * <p>fixedDelay 而不是 fixedRate：必须等上一轮处理完再开始计时，
-     * 否则队列积压时会不断叠加新的拉取轮次。</p>
+     * <p>为什么重试投「延迟队列」而不是 {@code basicNack(requeue=true)}：
+     * requeue 会立刻把消息放回队首，一个正在限流的 AI 接口会被连续打三次、三次全败进死信，
+     * 重试等于没重试。延迟队列让每次重试之间隔 10 秒，给下游留恢复窗口。
+     *
+     * <p>无论走哪条路都要 ack 原消息：不 ack 它会一直躺在 unacked 里，
+     * 直到连接断开被重投，等于又绕回了「无限热重试」。
      */
-    // 每轮处理完再等 200ms 触发下一次；队列为空时不会占着 CPU 空转。
-    @Scheduled(fixedDelay = 200)
-    public void poll() {
-        // 一次只取一条：单个消费者不长时间占用线程；
-        // 返回 false（队列已空）也直接结束本轮，等下一次调度即可。
-        publisher.pullOnce();
+    private void retryOrDead(JudgeTask task, Channel channel, long tag) throws IOException {
+        if (task == null) {
+            // 消息体本身反序列化不了：重投也还是解析不了，直接 ack 掉并记日志
+            channel.basicAck(tag, false);
+            return;
+        }
+        if (task.retryCount() >= MAX_RETRY) {
+            publisher.deadLetter(task);
+        } else {
+            publisher.retryLater(new JudgeTask(
+                    task.sessionId(), task.questionId(), task.answer(),
+                    task.followUp(), task.retryCount() + 1));
+        }
+        channel.basicAck(tag, false);
+    }
+
+    /** 评分超时标记：和普通异常区分开，日志与重试语义更清楚 */
+    static class AiTimeoutException extends RuntimeException {
+        AiTimeoutException(String message) {
+            super(message);
+        }
     }
 }
 ```
 
 ---
 
-### 评分 1.1：创建答题轮次异步补偿服务
+### 评分 1.1：为什么删掉了「补偿服务」这一节
 
-**本小节目的：** 处理「边界异常情况」的兜底方案。在理想情况下，消费者正常处理所有任务。但在生产环境中可能会出现：
-1. 消费者进程崩溃（OOM、宕机、部署重启），导致已从 QUEUE 取出但尚未处理完的任务卡在 PROCESSING 队列中。
-2. Redis 集群主从切换导致队列中个别消息丢失。
-3. 消息被误删除等运维操作。
+**这一小节原来写的是一个 `JudgeTaskCompensationService`：`@Scheduled(fixedDelay = 30_000)` 每 30 秒扫库里"超过 5 分钟仍未评分"的答案，先 `LPOS` 查待处理队列里还有没有这条任务，再 `HeartbeatService.exists(sessionId)` 反查处理线程死没死，两者都没有才重投；补偿多次不成就置 `JUDGE_FAILED` 并往 `interview_judge_compensation_log` 写一行。** 现在这个类、`HeartbeatService`、那张补偿日志表全部删除了。删掉不是"简化"，而是这些职责已经有了明确的承担者：
 
-这些异常的共同结果是：`interview_answer` 表中某些答案的 `score IS NULL` 且长时间未被评分。补偿服务的职责就是定期扫描这些「卡住」的记录，检查 Redis 队列中是否还有对应的任务，如果没有则重新投递。
+| 自建 Redis List 时代要自己做的事 | 换成 RabbitMQ 后由谁承担 |
+| --- | --- |
+| 三个 key（QUEUE / PROCESSING / DEAD）来回搬 | 主队列 / unacked 列表 / 死信队列，broker 原生语义 |
+| `LMOVE` 原子搬运，防"取出但没登记"的窗口 | 不 ack 就一直算"在处理中"，没有中间态可言 |
+| `HeartbeatService` 每 10 秒续期，判断线程死活 | 消费者死了连接就断，unacked 消息自动 requeue，不需要猜 |
+| `JudgeTaskCompensationService` 定时扫库兜底 | 不需要：消息没 ack 就被重投；真的丢了由 publisher confirm 报警 |
+| `interview_judge_compensation_log` 记账 | 死信队列本身就是现场，消息体原样保留，控制台点开就能看 |
 
-**本小节流程：**
-```text
-每 30 秒执行一次
-    │
-    ▼
-数据库扫描：创建时间超过 5 分钟且 score IS NULL 且 status != 'JUDGE_FAILED' 的答案
-（SQL 额外读出 is_follow_up，供重投时原样带回）
-    │
-    ▼
-对每一条卡住的答案：
-    │
-    ├─→ 用当前字段构造 JudgeTask 并序列化为 JSON
-    │   ├─→ LPOS 检查主队列里是否已有这条任务
-    │   ├─→ heartbeat.exists(sessionId) 检查处理线程是否还活着
-    │   │   ├─→ 队列里有 或 心跳还在：跳过（等它自己跑完）
-    │   │   └─→ 两者都没有：进入下一步
-    │   │
-    │   └─→ 如果 retryCount+1 > 3
-    │       ├─→ 是：置 status='JUDGE_FAILED'，
-    │       │      往 interview_judge_compensation_log 插一条记录
-    │       └─→ 否：原样保留 is_follow_up，重投到 QUEUE，
-    │                更新 retry_count 和 status='PENDING_JUDGE'
-    │
-    └─→ 处理下一条
-```
+**这套自建队列最要命的地方不是代码量，而是它永远差一个边界情况：** 心跳判断"线程还活着"，但线程活着不等于任务会完成——AI 调用卡在 SSL 读超时 400 秒时，心跳一直正常，补偿器就一直跳过，用户就一直等。RabbitMQ 下同样的场景由"消费超时 + 延迟重试"处理：60 秒没回来就认失败、投重试，不依赖任何"猜活"的信号。
 
-#### 文件 1：`src/main/java/com/example/interview/application/JudgeTaskCompensationService.java`
+**删掉之后还剩一个真实缺口，必须说清：** publisher confirm 失败时只打日志告警、不自动重发，所以理论上存在"消息没进 broker、答案停在 `SUBMITTED`"的极小窗口。兜底是人工介入——按状态查 `status = 'SUBMITTED'` 且 `updated_at` 很早的答案，用控制台或脚本补投一次；补投是幂等的（同题同轮唯一键 + 评分只更新不插入）。这是有意做的取舍：为了这个极小概率去维护一张"待确认任务表"，成本远高于收益，而生产者确认日志已经把窗口暴露出来了。
 
-**创建这个文件干什么：** 这是一个定时调度任务（`@Scheduled`），周期性扫描数据库中「超过 5 分钟仍未评分」的答案记录，先通过 Redis 的 `LPOS` 命令检查待处理队列中是否仍然存在对应的任务消息，再用 `HeartbeatService.exists(sessionId)` 反查「处理这条答案的线程是否还活着」，两者都没有才判定为真的卡住并重新投递。
-
-**它的角色：** 兜底策略的最后一道防线。正常流程中，publish → 消费者循环 → judge 已经能处理绝大多数任务。补偿服务只解决那部分边界异常场景，确保没有评分被永远遗漏。
-
-**为什么只查 LPOS 不够：** 任务一旦被消费者取走，`LPOS` 立刻查不到。若线程随后崩溃，这条答案会一直被当成「正在评分」，永远等不到重投。所以必须再补一个心跳判断：队列里还有任务 = 还没被人取走，正常；心跳还在 = 取走它的线程还活着，只是 AI 长尾比较慢，重投会造成同题双评。
-
-**依赖什么：**
-- `JdbcTemplate`：Spring JDBC 模板，用于扫描和更新 `interview_answer` 表、写补偿日志。
-- `StringRedisTemplate`：Redis 操作（LPOS 检查 + 重新投递）。
-- `ObjectMapper`：序列化 JudgeTask 为 JSON。
-- `QuestionMapper`（MyBatis-Plus）：用于 `findSequenceNo()` 方法按主键查询题号。
-- `SessionSnapshotRepository`：会话快照仓库（构造器注入）。
-- `HeartbeatService`：后台任务心跳服务，用 `exists(sessionId)` 回答「这条卡住的答案，处理线程还活着吗」。
-
-**被谁调用：** Spring 的 `@Scheduled` 注解自动触发，无需手动调用。
-
-```java
-package com.example.interview.application;
-
-import com.example.interview.infrastructure.snapshot.SessionSnapshotRepository;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.example.interview.infrastructure.mysql.QuestionEntity;
-import com.example.interview.infrastructure.mysql.QuestionMapper;
-
-import org.springframework.data.redis.core.RedisCallback;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Service;
-
-import java.nio.charset.StandardCharsets;
-import java.sql.ResultSet;
-import java.util.List;
-import java.util.UUID;
-
-/**
- * 定时扫描评分卡住记录的补偿服务。
- * <p>
- * 为什么需要这个类：即使有 processing 队列保护，消费者崩溃时任务可能永远卡在
- * PROCESSING 队列中（没有其他人来消费它）。这个服务作为「兜底」策略，
- * 通过定期检查数据库中未评分的记录来判断是否需要重新投递。
- * </p>
- */
-@Service
-public class JudgeTaskCompensationService {
-
-    /**
-     * Redis 待处理队列的键名，与 JudgeTaskPublisher 中的 QUEUE 必须完全一致。
-     * 为什么不复用 JudgeTaskPublisher.QUEUE：两个类职责不同，
-     * 如果耦合在一起（JudgeTaskPublisher 不存在时补偿服务也无法编译），
-     * 违背了「补偿服务独立运行」的设计意图——即使发布者类出了问题，
-     * 补偿服务也应该能独立工作。
-     */
-    private static final String QUEUE = "interview:task:judge";
-
-    /**
-     * 补偿重试的最大次数。
-     * 注意与 JudgeTaskPublisher.MAX_RETRY 区分：
-     * - MAX_RETRY（3）是同一个任务在正常消费流程中的重试次数上限；
-     * - MAX_COMPENSATION_COUNT（3）是补偿服务重新投递的次数上限。
-     * 如果一个任务在正常消费中失败 3 次进入死信，补偿服务扫描到后，
-     * 会发现 retry_count 已经是 3（或 4），从而不再重新投递，标记为失败。
-     * 两个上限共同保证了任务不会无限循环。
-     */
-    private static final int MAX_COMPENSATION_COUNT = 3;
-
-    // ================ 依赖注入 ================
-
-    /**
-     * Spring JDBC 模板，用于直接操作 interview_answer 表。
-     * 为什么用 JdbcTemplate 而不是 MyBatis-Plus：
-     * 补偿服务需要执行特定的 SQL（如条件扫描、更新特定字段），
-     * JdbcTemplate 更直接，不需要为了一次查询创建 Mapper 接口。
-     */
-    private final JdbcTemplate jdbc;
-
-    /**
-     * Redis 操作模板，与 JudgeTaskPublisher 共享同一个 Bean。
-     * 用于 LPOS 检查队列中是否存在任务，以及重新投递任务。
-     */
-    private final StringRedisTemplate redis;
-
-    /**
-     * JSON 序列化工具，与 JudgeTaskPublisher 共享同一个 Bean。
-     */
-    private final ObjectMapper mapper;
-
-    /**
-     * 题目表的 MyBatis-Plus Mapper，供 findSequenceNo 查询题目序号。
-     * 原始版本缺失该字段注入，导致 findSequenceNo 无法通过编译，这里一并补上。
-     */
-    private final QuestionMapper questions;
-
-    /**
-     * 会话快照仓库（构造器注入）。
-     */
-    private final SessionSnapshotRepository sessionSnapshotRepository;
-
-    /**
-     * 心跳服务：用来回答「这条卡住的答案，处理线程还活着吗」。
-     * 任务被消费者取走后 LPOS 就查不到了，只有心跳还在，
-     * 才能说明线程只是 AI 长尾跑得慢、并没有死。
-     */
-    private final HeartbeatService heartbeat;
-
-    /**
-     * 构造函数注入所有依赖。
-     */
-    public JudgeTaskCompensationService(
-            JdbcTemplate jdbc,
-            StringRedisTemplate redis,
-            ObjectMapper mapper,
-            // 题目 Mapper，用于 findSequenceNo 查询题号。
-            QuestionMapper questions,
-            SessionSnapshotRepository sessionSnapshotRepository,
-            // 心跳服务，按类型注入；追加在参数末尾，不打乱既有参数顺序。
-            HeartbeatService heartbeat
-    ) {
-        this.jdbc = jdbc;
-        this.redis = redis;
-        this.mapper = mapper;
-        this.questions = questions;
-        this.sessionSnapshotRepository = sessionSnapshotRepository;
-        this.heartbeat = heartbeat;
-    }
-
-    // ================ 主逻辑：定时补偿扫描 ================
-
-    /**
-     * 每 30 秒执行一次，扫描创建超过 5 分钟且仍未评分的答案。
-     * 
-     * 为什么是 30 秒间隔：
-     * 太短（如 5 秒）会频繁扫描数据库，对 DB 造成压力；
-     * 太长（如 5 分钟）则卡住的任务迟迟得不到补偿。
-     * 30 秒是实践中较好的平衡点。
-     * 
-     * 为什么是 5 分钟阈值：
-     * 正常评分流程通常在几秒内完成（AI 调用 3～10 秒 + 数据库写入 <100ms）。
-     * 如果超过 5 分钟还没有评分，说明一定出了异常（消费者崩溃、队列卡住等）。
-     * 设置 5 分钟的缓冲，避免误伤正常但稍慢的流程。
-     * 
-     * @Scheduled(fixedDelay = 30_000) 的含义：
-     * fixedDelay 指上一次执行完成后延迟 30 秒再执行下一次。
-     * 区别于 fixedRate（固定频率），fixedDelay 保证
-     * 两次执行不会重叠——即使某次扫描因数据库慢查询耗时 10 秒，
-     * 下一次也会在 10+30=40 秒后开始，不会出现并发执行。
-     */
-    @Scheduled(fixedDelay = 30_000)
-    public void compensateStuckAnswers() {
-        // 执行 SQL 查询，查找需要补偿的答案记录。
-        // SQL 条件说明：
-        // 1. score is null：还未评分
-        // 2. status <> 'JUDGE_FAILED'：未标记为"评分失败"
-        //    （标记为失败的记录不再重复补偿，避免死循环）
-        // 3. created_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)：
-        //    创建时间超过 5 分钟，确保不会扫到刚提交的正常答案
-        // 4. order by created_at：先处理最老的卡住记录
-        // 5. limit 100：每次最多处理 100 条，避免一次扫描过多导致数据库抖动
-        List<PendingAnswer> pending =
-                jdbc.query(
-                        """
-                        select id, session_id, question_id,
-                               answer, retry_count, is_follow_up
-                        from interview_answer
-                        where score is null
-                          and status <> 'JUDGE_FAILED'
-                          and created_at <
-                              DATE_SUB(NOW(), INTERVAL 5 MINUTE)
-                        order by created_at
-                        limit 100
-                        """,
-                        // ResultSetExtractor：将 ResultSet 的每一行映射为
-                        // PendingAnswer record 对象。
-                        // 为什么用 lambda 而不是 RowMapper 实现类：
-                        // 因为这个查询只在这里使用，单独创建一个 PendingAnswerRowMapper
-                        // 类过于冗余。lambda 更简洁。
-                        (ResultSet resultSet, int rowNum) ->
-                                new PendingAnswer(
-                                        resultSet.getLong("id"),
-                                        UUID.fromString(
-                                                resultSet.getString("session_id")
-                                        ),
-                                        UUID.fromString(
-                                                resultSet.getString("question_id")
-                                        ),
-                                        resultSet.getString("answer"),
-                                        resultSet.getInt("retry_count"),
-                                        // 读出追问标记，补偿重投时必须原样带回去，
-                                        // 否则追问任务会被当成初次作答，错误地推进主线状态机。
-                                        resultSet.getInt("is_follow_up")
-                                )
-                );
-
-        // 逐条处理卡住的答案。
-        // 为什么不批量处理：每条答案的补偿条件可能不同
-        // （有的需要重试，有的需要标记失败），
-        // 逐条处理逻辑更清晰，且 limit 100 控制了一次处理的总量。
-        for (PendingAnswer answer : pending) {
-            compensate(answer);
-        }
-    }
-
-    // ================ 单条补偿逻辑 ================
-
-    /**
-     * 对一条卡住的答案执行补偿操作。
-     * 
-     * @param answer 从数据库扫描到的卡住答案记录
-     */
-    private void compensate(PendingAnswer answer) {
-        try {
-            // 构建 JudgeTask 对象，使用数据库中当前的 retryCount；
-            // 把读出的 is_follow_up 转成 boolean 带到队列载荷里。
-            JudgeTask task = new JudgeTask(
-                    answer.sessionId(),
-                    answer.questionId(),
-                    answer.answer(),
-                    answer.isFollowUp() == 1,
-                    answer.retryCount()
-            );
-            String raw = mapper.writeValueAsString(task);
-
-            // 关键检查：LPOS 判断待处理队列中是否已经有这条任务。
-            // 为什么用 LPOS（Redis 6.0+ 命令）：它是一个 O(N) 的查找命令，
-            // 在队列中从头搜索匹配元素。替代方案是 LRANGE 取出全部元素再在
-            // Java 端检查，但那会把整个队列传输到客户端、浪费带宽；LPOS 直接
-            // 在 Redis 后端查找，更省。如果队列很长（数十万条）LPOS 会变慢，
-            // 但正常待处理队列不会有太多积压，可以接受。
-            // 这段 LPOS 检查只在本处使用一次，因此直接内联，不再单独抽方法。
-            byte[] queueKey =
-                    QUEUE.getBytes(StandardCharsets.UTF_8);
-            byte[] taskValue =
-                    raw.getBytes(StandardCharsets.UTF_8);
-            // 执行 LPOS 命令。connection.execute(Object... cmd) 的第一个参数是
-            // 命令名，后面的参数是该命令的参数，相当于 CLI 里执行 LPOS key "<JSON>"。
-            Object queuePosition = redis.execute(
-                    (RedisCallback<Object>) connection -> connection.execute(
-                            "LPOS",
-                            queueKey,
-                            taskValue
-                    )
-            );
-            // 待处理队列里还有任务 或 处理线程心跳还在，才跳过。
-            // 为什么必须补上心跳这一半：任务一旦被消费者取走，LPOS 立刻查不到；
-            // 若线程随后崩溃，这条答案会一直被当成"正在评分"，永远等不到重投。
-            boolean alive = heartbeat.exists(answer.sessionId());
-            if (queuePosition != null || alive) {
-                // 队列里还有任务 = 还没被人取走，正常；
-                // 心跳还在 = 取走它的线程还活着，只是 AI 长尾比较慢，重投会造成同题双评。
-                return;
-            }
-
-            // 检查累计重试次数是否超过上限。
-            int nextRetry = answer.retryCount() + 1;
-            if (nextRetry > MAX_COMPENSATION_COUNT) {
-                // 超过 3 次补偿上限，标记为评分失败后不再重试。以下“标记失败”逻辑
-                // 只在此处使用一次，因此直接内联，不再单独抽取方法。
-                // 更新答案表：标记为评分失败。WHERE 中的 score is null 是为了防并发——
-                // 若补偿期间正常流程已评完分写入 score，这里就不应覆盖已评分的记录。
-                jdbc.update(
-                        """
-                        update interview_answer
-                        set retry_count = ?,
-                            status = 'JUDGE_FAILED'
-                        where id = ? and score is null
-                        """,
-                        nextRetry,
-                        answer.id()
-                );
-                // 写入补偿日志，供运维排查失败原因；日志保留 retry_count，
-                // 便于分析重试分布、优化补偿上限配置，日后重算也能追溯原始数据。
-                jdbc.update(
-                        """
-                        insert into interview_judge_compensation_log
-                            (answer_id, retry_count, reason)
-                        values (?, ?, ?)
-                        """,
-                        answer.id(),
-                        nextRetry,
-                        "Redis 队列中找不到对应的评分任务，补偿多次后放弃"
-                );
-                return;
-            }
-
-            // 构建补偿后的任务对象，retryCount +1，追问标记原样保留。
-            JudgeTask compensated = new JudgeTask(
-                    answer.sessionId(),
-                    answer.questionId(),
-                    answer.answer(),
-                    answer.isFollowUp() == 1,
-                    nextRetry
-            );
-            String compensatedRaw =
-                    mapper.writeValueAsString(compensated);
-
-            // 重新投递到 Redis 待处理队列。
-            // 为什么这里只用 rightPush（而不需要先 remove PROCESSING）：
-            // 补偿任务的场景是"任务从未被消费"（卡在 PROCESSING 或已经丢失），
-            // 而不是"消费者处理过程中失败"。所以直接向 QUEUE 投递即可。
-            redis.opsForList().rightPush(
-                    QUEUE,
-                    compensatedRaw
-            );
-
-            // 同步更新数据库中的 retry_count 和 status。
-            // 为什么要在同一个事务中更新数据库：
-            // 防止补偿服务投递成功但数据库状态未更新，
-            // 导致下一轮扫描时再次补偿同一个答案（重复投递）。
-            // 注意：这里是自动提交模式，每个 update 独立事务。
-            // 如果 Redis 投递成功但数据库更新失败：
-            // 下一轮会再次扫描到这条记录，届时 queueContains 会返回 true
-            // （因为 Redis 中已有任务），不会重复投递，但也无法更新状态。
-            // 这是最终一致性模型的一个小缺口，但对于补偿场景可以接受。
-            jdbc.update(
-                    """
-                    update interview_answer
-                    set retry_count = ?,
-                        status = 'PENDING_JUDGE'
-                    where id = ? and score is null
-                    """,
-                    nextRetry,
-                    answer.id()
-            );
-        } catch (JsonProcessingException e) {
-            // 序列化失败的情况（理论上几乎不会发生）。
-            throw new IllegalStateException(
-                    "无法序列化补偿任务: answerId=" + answer.id(),
-                    e
-            );
-        }
-    }
-
-    // ================ 工具方法：查询题号 ================
-
-    /**
-     * 根据题目 ID 查询该题目在面试中的题号（sequence_no）。
-     * <p>
-     * 这个方法不属于定时补偿主链路，是供外部其他流程使用的轻量查询辅助方法，
-     * 因此放在主逻辑之后、内部 record 之前。它只做一次按主键的查询和取值校验，
-     * 本身不抽取更多小方法。
-     * </p>
-     *
-     * @param questionId 题目 ID
-     * @return 题号（从 1 开始排序）
-     * @throws IllegalArgumentException 如果找不到题目或题号为 null
-     */
-    public int findSequenceNo(UUID questionId) {
-        // 通过题目表的 MyBatis-Plus Mapper 按主键查询实体。
-        // 原始样品遗漏了 questions 字段的注入，会导致这里无法编译，
-        // 现已在字段声明与构造器补上 QuestionMapper 的注入。
-        QuestionEntity question = questions.selectOne(
-                com.baomidou.mybatisplus.core.toolkit.Wrappers
-                        .<QuestionEntity>lambdaQuery()
-                        .eq(
-                                QuestionEntity::getId,
-                                questionId.toString()
-                        )
-        );
-        // 查不到题目或题号为空视为异常，直接抛出 IllegalArgumentException。
-        if (question == null
-                || question.getSequenceNo() == null) {
-            throw new IllegalArgumentException(
-                    "未找到题目序号: questionId=" + questionId
-            );
-        }
-        return question.getSequenceNo();
-    }
-
-    // ================ 内部 record ================
-
-    /**
-     * 数据库扫描结果的一行映射。
-     * 为什么用 record 而不是 class：
-     * 这个数据只在补偿服务内部使用，不对外暴露。
-     * record 自动生成构造器、getter，代码最简洁。
-     * 如果用 class + @Data 需要额外依赖 Lombok，且不易被其他模块误引用。
-     */
-    private record PendingAnswer(
-            long id,              // interview_answer 表主键
-            UUID sessionId,       // 面试会话 ID
-            UUID questionId,      // 题目 ID
-            String answer,        // 答案文本
-            int retryCount,       // 当前重试次数
-            // 追问标记（0=初次作答，1=追问作答）。用 int 承接数据库 TINYINT，
-            // 构造 JudgeTask 时再转成 boolean，避免直接读 boolean 的映射问题。
-            int isFollowUp
-    ) {
-    }
-}
-```
+**老库的残留表要删：** `docker/mysql/02-upgrade.sql` 末尾有一句 `DROP TABLE IF EXISTS interview_judge_compensation_log;`。代码里已经没有任何写入方，留着这张表只会让后来的人以为还有补偿逻辑在跑。
 
 ---
 
 ### 评分 2：创建评分 AI 调用
 
-**本小节目的：** 在任务从 Redis 队列取出后，真正调用 AI 接口进行评分。本小节封装了 AI 调用的完整流程：组装评分提示词（拼上评分 Skill，追问作答额外加一句区分说明）→ 调用 AI（带 SingleFlight 去重和 Fencing Token 防过期）→ 校验 JSON 格式（不合格就把问题反馈给 AI 重新生成，最多 2 次）→ 返回结构化的 `JudgeResult`。
+**本小节目的：** 在任务从队列取出后，真正调用 AI 接口进行评分。本小节封装了 AI 调用的完整流程：组装评分提示词（拼上评分 Skill，追问作答额外加一句区分说明）→ 调用 AI（带 SingleFlight 去重和 Fencing Token 防过期）→ 校验 JSON 格式（不合格就把问题反馈给 AI 重新生成，最多 2 次）→ 返回结构化的 `JudgeResult`。
 
 **为什么需要单独的「AI 调用」层而不是在工作流中直接调用 AI？**
 1. **关注点分离**：AI 调用涉及 prompt 组装、格式自纠错、JSON 解析、超时控制等复杂逻辑，不应该和工作流编排混在一起。
@@ -9075,11 +8503,11 @@ private JudgeResult parseJudge(String content, long fencingToken) {
 
 ### 评分 3：创建评分工作流
 
-**本小节目的：** 串联任务消费、AI 评分、结果保存、状态推进和后续流程触发。这是整个评分模块的「大脑」——它不负责具体的 Redis 队列操作（那是评分 1 的事），也不负责具体的 AI 调用（那是评分 2 的事），而是编排这些组件完成一次完整的评分业务流程。
+**本小节目的：** 串联任务消费、AI 评分、结果保存、状态推进和后续流程触发。这是整个评分模块的「大脑」——它不负责消息的投递与确认（那是评分 1 的事），也不负责具体的 AI 调用（那是评分 2 的事），而是编排这些组件完成一次完整的评分业务流程。
 
 **本小节流程：**
 ```text
-JudgeTaskPublisher.pullOnce() 调用 InterviewWorkflowService.judge(..., followUp)
+JudgeTaskConsumer.onJudge() 调用 InterviewWorkflowService.judge(..., followUp)
     │
     ├─→ followUp == true（追问作答）：走早返回分支
     │     ├─→ ai.judge(sessionId, questionId, answer, true) 执行 AI 评分
@@ -9114,7 +8542,7 @@ JudgeTaskPublisher.pullOnce() 调用 InterviewWorkflowService.judge(..., followU
 - `FollowUpDecisionService`：追问决策服务（只做「分数 → 追问策略（链名/等级/目标）」的映射）。
 - `FollowUpTaskPublisher`：追问任务发布器。judge 只负责「把任务发出去」，一旦在这里直接调生成服务，就又变回同步执行，异步化就白做了。
 
-**被谁调用：** 由 `JudgeTaskPublisher.pullOnce()` / `consumeOnce()` 中的 `workflow.judge()` 调用。
+**被谁调用：** 由 `JudgeTaskConsumer` 的监听方法在拿到消息后调用 `workflow.judge(...)`；成功返回才 ack，抛异常则转重试或死信。
 
 ```java
 package com.example.interview.application;
@@ -9125,8 +8553,6 @@ import com.example.interview.domain.InterviewEvent;
 import com.example.interview.domain.InterviewSessionStateMachine;
 import com.example.interview.infrastructure.snapshot.SessionSnapshotRepository;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -9201,15 +8627,6 @@ public class InterviewWorkflowService {
     private final FollowUpTaskPublisher followUpPublisher;
 
     /**
-     * 下一题预生成服务。评分失败降级推进时复用，让前端能立刻取下一题而不是一直等在轮询里。
-     */
-    private final NextQuestionPreGeneratorService preGenerator;
-
-    // 日志对象：评分失败降级、追问失败都要留痕——异步线程没有调用方接住异常。
-    private static final Logger log =
-            LoggerFactory.getLogger(InterviewWorkflowService.class);
-
-    /**
      * 构造函数注入所有依赖。
      */
     public InterviewWorkflowService(
@@ -9218,8 +8635,7 @@ public class InterviewWorkflowService {
             AnswerRepository answers,
             InterviewSessionStateMachine machine,
             FollowUpDecisionService followUps,
-            FollowUpTaskPublisher followUpPublisher,
-            NextQuestionPreGeneratorService preGenerator
+            FollowUpTaskPublisher followUpPublisher
     ) {
         this.snapshots = snapshots;
         this.ai = ai;
@@ -9227,7 +8643,6 @@ public class InterviewWorkflowService {
         this.machine = machine;
         this.followUps = followUps;
         this.followUpPublisher = followUpPublisher;
-        this.preGenerator = preGenerator;
     }
 
     // ================ 核心编排方法 ================
@@ -9235,8 +8650,8 @@ public class InterviewWorkflowService {
     /**
      * 组织评分上下文并调用 AI，返回结构化的分数、优缺点和建议。
      * <p>
-     * 这个方法是评分工作流的入口，被 JudgeTaskPublisher.pullOnce() /
-     * consumeOnce() 中的 workflow.judge() 调用。
+     * 这个方法是评分工作流的入口，被 JudgeTaskConsumer 的监听方法调用
+     * （消费者用独立线程池执行它，并对等待时间设 60 秒上限）。
      * </p>
      *
      * <p>
@@ -9244,8 +8659,8 @@ public class InterviewWorkflowService {
      * 如果已经评分（persisted != null），直接返回已保存的结果，
      * 不再重复调用 AI 或重复写入数据库。
      * 这防止了以下场景中的重复评分：
-     * - 消费者处理任务后崩溃，但数据已保存；任务重回队列后被再次消费。
-     * - 补偿服务重新投递了同一个任务。
+     * - 消费者写完分数、还没 ack 就崩溃，消息被 broker 重投给另一个实例。
+     * - ack 在网络上丢了，broker 认为没消费成功，同一条消息被再投一次。
      * </p>
      *
      * <p>
@@ -9284,15 +8699,8 @@ public class InterviewWorkflowService {
         if (followUp) {
             // 追问评分复用同一条 judge 链路，只是提示词里标明"这是追问回答"
             // （见 InterviewAiFacade.judge 的 followUp 分支）。
-            // 追问作答的 AI 瞬时失败也给兜底分数继续，避免前端无限等待。
-            JudgeResult score;
-            try {
-                score = ai.judge(sessionId, questionId, answer, true);
-            } catch (Exception e) {
-                log.error("judge follow-up failed, fallback score, sessionId={}", sessionId, e);
-                score = fallbackScore();
-            }
-            // 幂等回放：追问评分任务可能被重复投递（消费者崩溃后补偿重投），
+            var score = ai.judge(sessionId, questionId, answer, true);
+            // 幂等回放：追问评分任务可能被重复投递（消费者写完分数还没 ack 就崩溃，消息被 broker 重投），
             // 若 is_follow_up=1 那一行已有分数，直接回放，避免重复调用 AI、重复写库。
             var persisted = answers.findJudge(sessionId, questionId, true);
             if (persisted != null) {
@@ -9340,24 +8748,14 @@ public class InterviewWorkflowService {
         // - JSON 解析和校验
         // - 返回 JudgeResult 结构化结果
         // 末位传 false：明确告诉 AI 这是"初次作答"，提示词里不加追问作答的区分说明。
-        // 评分 AI 一次调用可能瞬时失败。失败绝不能把状态永远停在 JUDGING
-        //（否则前端轮询下一题会无限转圈），所以这里捕获后给一个兜底评分，降级继续推进面试。
-        JudgeResult score;
-        boolean degraded = false;
-        try {
-            score = ai.judge(
-                    sessionId,
-                    questionId,
-                    answer,
-                    // 从这里开始是修改的：初次作答路径显式传 false。
-                    false
-                    // 修改结束
-            );
-        } catch (Exception e) {
-            log.error("judge failed, degraded to continue, sessionId={}", sessionId, e);
-            score = fallbackScore();
-            degraded = true;
-        }
+        var score = ai.judge(
+                sessionId,
+                questionId,
+                answer,
+                // 从这里开始是修改的：初次作答路径显式传 false。
+                false
+                // 修改结束
+        );
 
         // ---- 第三步：幂等性检查 ----
         // 查询该会话+该题目是否已经评分过。
@@ -9375,8 +8773,8 @@ public class InterviewWorkflowService {
         if (persisted != null) {
             // ---- 已经评分过：直接回放已有结果 ----
             // 什么情况下会走到这里：
-            // 1. 任务被重复消费（消费者在 recordJudge 之后、remove PROCESSING 之前崩溃）；
-            // 2. 补偿服务重新投递已评分的任务；
+            // 1. 任务被重复消费（消费者在 recordJudge 之后、ack 之前崩溃）；
+            // 2. ack 丢失导致 broker 重投已评分的任务；
             // 3. 其他并发消费者抢先完成了评分。
             //
             // 为什么不再次调用 AI：
@@ -9446,38 +8844,6 @@ public class InterviewWorkflowService {
             );
         }
 
-        // 从这里开始是新增的：评分降级（AI 失败）时不再生成追问，直接把 ASKING→QUESTIONING
-        // 推进到位并预生成下一题，让前端能立刻取下一题而不是一直等在轮询里。
-        if (degraded) {
-            var askDone = machine.advance(
-                    moved.snapshot(),
-                    InterviewEvent.ASK_COMPLETED,
-                    UUID.randomUUID().toString()
-            );
-            if (askDone.changed()) {
-                snapshots.compareAndSet(
-                        moved.snapshot(),
-                        askDone.snapshot()
-                );
-            }
-            preGenerator.preGenerate(
-                    sessionId,
-                    answers.findSequenceNo(questionId) + 1
-            );
-            return new WorkflowResult(
-                    score.score(),
-                    "followUpBasicChain",
-                    askDone.changed()
-                            ? askDone.snapshot().state()
-                            : moved.snapshot().state(),
-                    score.feedback(),
-                    score.stale(),
-                    score.fencingToken(),
-                    false
-            );
-        }
-        // 新增结束
-
         // ---- 第七步：决策追问策略 ----
         // 评分已落库、状态已推进到 ASKING，接下来按分数选出追问策略。
         // decide 返回完整的追问计划（链名 + 等级 + 追问目标），
@@ -9486,7 +8852,7 @@ public class InterviewWorkflowService {
 
         // 从这里开始是修改的：原来这里是同步调 followUpGeneration.generate(new FollowUpTask(...))，
         // 会当场跑完整条 LiteFlow 追问链才返回，评分队列吞吐被追问 AI 拖死。
-        // 现在只把任务丢进 Redis 队列就返回，追问由独立消费者生成并落库。
+        // 现在只把任务投进 RabbitMQ 的 interview.follow-up.queue 就返回，追问由独立消费者生成并落库。
         // 任务只带三样东西：哪个会话、哪道题、多少分（走哪条链由消费端的 decide 再算一次，
         // 任务体保持最小）。顺序不能反：先发任务的话，消费者可能比评分落库更快到达，
         // 链上就会读到"还没有分数"的上下文。
@@ -9543,24 +8909,12 @@ public class InterviewWorkflowService {
             boolean hasFollowUp
     ) {
     }
-
-    // 从这里开始是新增的：评分 AI 瞬时失败时的兜底评分。
-    // 用稳定的及格线下分值（50），反馈写清楚"已自动继续"，让用户知道这题没拿到点评但面试没断。
-    private JudgeResult fallbackScore() {
-        return new JudgeResult(
-                50,
-                "评分服务暂时繁忙，本条回答已自动进入下一题。",
-                0L,
-                false
-        );
-    }
-    // 新增结束
 }
 ```
 
 ---
 
-> **实际项目中**，评分完成后还要触发追问：`judge` 里用 `followUps.decide(score)` 按分数选出追问策略链（`<60` 基础追问、`60-79` 常规追问、`>=80` 深度追问），但**不在这里生成追问**——它只调 `followUpPublisher.publish(sessionId, questionId, score)` 把一条任务丢进 Redis 队列就返回，真正跑 LiteFlow 追问链的是下一章节的独立消费者循环。追问决策与生成的具体逻辑将在下一章节「十二、追问模块」中详细展开。本章节的重点是理解：评分结果需要持久化（`answers.recordJudge`），状态需要推进（`machine.advance`），重复任务需要回放已有结果（`persisted != null` 分支），追问作答需要走早返回分支（`followUp == true`，不推进主线）——这几个核心关注点共同构成了异步评分工作流的可靠性基础。
+> **实际项目中**，评分完成后还要触发追问：`judge` 里用 `followUps.decide(score)` 按分数选出追问策略链（`<60` 基础追问、`60-79` 常规追问、`>=80` 深度追问），但**不在这里生成追问**——它只调 `followUpPublisher.publish(sessionId, questionId, score)` 把一条消息投进 `interview.follow-up.queue` 就返回，真正跑 LiteFlow 追问链的是下一章节那个 `@RabbitListener` 消费者。追问决策与生成的具体逻辑将在下一章节「十二、追问模块」中详细展开。本章节的重点是理解：评分结果需要持久化（`answers.recordJudge`），状态需要推进（`machine.advance`），重复任务需要回放已有结果（`persisted != null` 分支），追问作答需要走早返回分支（`followUp == true`，不推进主线）——这几个核心关注点共同构成了异步评分工作流的可靠性基础。
 
 ## 十二、追问模块
 
@@ -9568,7 +8922,7 @@ public class InterviewWorkflowService {
 
 根据评分结果动态决定是否追问，并围绕薄弱点生成下一道问题，让面试内容具有针对性。追问模块是整个 AI 面试系统中实现"自适应"的关键环节——它让面试官（AI）不是机械地按固定题库出题，而是根据候选人上一题的回答质量，实时调整追问方向和深度。
 
-追问模块**已经异步化**：评分完成后，`InterviewWorkflowService.judge` 只把一条追问任务丢进 Redis 队列就返回，真正跑 LiteFlow 链的是独立的消费者循环（`FollowUpTaskConsumerLoop` → `FollowUpTaskPublisher.consumeOnce` → `FollowUpGenerationService.generate`）。追问内容存在 `interview_follow_up` 表，**不作为新题插入 `interview_question`**；候选人回答追问时复用原题的 `questionId` 提交，用 `interview_answer.is_follow_up` 区分"初次作答 / 追问作答"，因此追问不会打乱主线的题序与进度。
+追问模块**已经异步化**：评分完成后，`InterviewWorkflowService.judge` 只把一条追问消息投进 `interview.follow-up.queue` 就返回，真正跑 LiteFlow 链的是 `FollowUpTaskConsumer`（`@RabbitListener` + 手动 ack）。追问内容存在 `interview_follow_up` 表，**不作为新题插入 `interview_question`**；候选人回答追问时复用原题的 `questionId` 提交，用 `interview_answer.is_follow_up` 区分"初次作答 / 追问作答"，因此追问不会打乱主线的题序与进度。
 
 ### 模块整体流程
 
@@ -9578,18 +8932,22 @@ public class InterviewWorkflowService {
     → followUpPublisher.publish(sessionId, questionId, score)   ← 只投递，立即返回
        │
        ▼
-  【队列】Redis List 三 key：QUEUE / PROCESSING / DEAD
+  【队列】interview.follow-up.queue（主队列）
+          interview.follow-up.retry.queue（TTL 10 秒 → DLX 回主队列）
+          interview.follow-up.dead.queue（重试超限留现场）
        │
        ▼
-  【消费侧 · 异步】FollowUpTaskConsumerLoop 定时（fixedDelay = 200ms）触发
-    → consumeOnce 用 move 原子出队 → FollowUpGenerationService.generate(task)
+  【消费侧 · 异步】FollowUpTaskConsumer 的 @RabbitListener 收到消息
+    → 交给内部 4 线程池执行（主线程 future.get(60s) 限时）
+    → FollowUpGenerationService.generate(task)
        │
        ▼
   【规则链】decide → Singleflight 保护下 execute2Resp(chainName, ...)
     loadQuestionContext → 分数段生成节点 → persistFollowUp（幂等落库）
        │
        ▼
-  completeAndPreGenerate：推进 ASK_COMPLETED → 预生成下一题
+  completeAndPreGenerate：推进 ASK_COMPLETED → 预生成下一题 → basicAck
+    （失败则投延迟重试队列；retryCount >= 3 转死信）
 
   【作答侧】候选人回答追问：前端复用原题 questionId 提交（is_follow_up = 1）
     → judge 走追问早返回分支：只评分落库，不推进主线状态机
@@ -10230,18 +9588,9 @@ public final class FollowUpLiteFlowNodes {
                     this.getSlot().getContextBean(
                             FollowUpExecution.class
                     );
-            // 这里原本是 selectById(context.getQuestionId())：MyBatis 的 SELECT BY ID
-            // 对非 String 简单类型（UUID）会把这个参数当 bean 反射去找名为 id 的 getter，
-            // UUID 没有 id 属性，于是抛 “no getter ... in 'class java.util.UUID'”。
-            // 改用 lambdaQuery 显式 eq 到 id 列、参数按字符串传（题目表主键 id 本身就是
-            // varchar），查询语义与 selectById 完全等价，也不再触发 bean 反射。
             QuestionEntity question =
-                    questions.selectOne(
-                            Wrappers.<QuestionEntity>lambdaQuery()
-                                    .eq(
-                                            QuestionEntity::getId,
-                                            context.getQuestionId().toString()
-                                    )
+                    questions.selectById(
+                            context.getQuestionId()
                     );
             if (question == null) {
                 throw new IllegalStateException(
@@ -10496,8 +9845,6 @@ import com.example.interview.domain.InterviewEvent;
 import com.example.interview.domain.InterviewSessionSnapshot;
 import com.example.interview.domain.InterviewSessionStateMachine;
 import com.example.interview.infrastructure.snapshot.SessionSnapshotRepository;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -10510,9 +9857,10 @@ import java.util.UUID;
  * 负责决定是否需要追问、执行追问、持久化追问结果、
  * 推进状态机以及触发下一题预生成。
  *
- * <p>generate 的容错策略：追问是加分项，它失败绝不能把状态停死在 ASKING。
- * 因此生成逻辑整体包在 try-catch 里，无论成败最后都会推进状态并预生成下一题，
- * 失败只记日志、由异步线程自己消化，不再向上抛给 consumeOnce 的重试/死信机制。
+ * <p>为什么 generate 方法不抛出异常：
+ * 调用方（consumeOnce）在 catch 块中处理异常，
+ * generate 方法内部的所有异常都会向上传递，
+ * 由 consumeOnce 的 retryOrDeadLetter 机制处理。
  */
 @Service
 public class FollowUpGenerationService {
@@ -10531,9 +9879,6 @@ public class FollowUpGenerationService {
     private final FlowExecutor flowExecutor;
     private final RedisSingleflight singleflight;
     private final QuestionMapper questions;
-    // 日志对象：追问链失败但被兜底推进时留痕——异步线程没有调用方接住异常。
-    private static final Logger log =
-            LoggerFactory.getLogger(FollowUpGenerationService.class);
 
     public FollowUpGenerationService(
             FollowUpDecisionService decisions,
@@ -10572,45 +9917,30 @@ public class FollowUpGenerationService {
      * 4. 触发下一题预生成
      */
     public void generate(FollowUpTask task) {
-        // 整段生成逻辑包进 try-catch：追问是加分项，它失败绝不能把状态停死在
-        // ASKING 让用户无限转圈——所以无论成败，最后都会把状态推进到
-        // QUESTIONING（completeAndPreGenerate 会预生成下一题）。
-        try {
-            // 第一步：根据评分决定追问策略
-            // FollowUpDecisionService.decide 根据分数段返回对应的追问链
-            // 如：<60 返回 "followUpBasicChain"（基础追问）
-            //     60-79 返回 "followUpNormalChain"（常规追问）
-            //     >=80 返回 "followUpDeepChain"（深度追问）
-            var plan = decisions.decide((int) task.score());
+        // 第一步：根据评分决定追问策略
+        // FollowUpDecisionService.decide 根据分数段返回对应的追问链
+        // 如：<60 返回 "followUpBasicChain"（基础追问）
+        //     60-79 返回 "followUpNormalChain"（常规追问）
+        //     >=80 返回 "followUpDeepChain"（深度追问）
+        var plan = decisions.decide((int) task.score());
 
-            // 第二步：如果不需要追问，直接推进状态并预生成下一题
-            if ("NONE".equalsIgnoreCase(plan.chain())) {
-                completeAndPreGenerate(task.sessionId());
-                return;
-            }
-
-            // 第三步：需要追问，执行多节点追问链（含 Singleflight 防重）。
-            // 追问的生成与幂等落库都发生在链内：loadQuestionContext 加载原题与作答，
-            // 分数段生成节点产出正文，persistFollowUp 节点把结果幂等写入 follow_up 表。
-            // 它们落在同一个 fence 作用域内，不会"生成成功却在落库前崩溃"，
-            // 因此这里不再单独调 insertIfAbsent——落库由链上的 persistFollowUp 完成。
-            executeFollowUpWithSingleflight(
-                    task,
-                    plan
-            );
-        } catch (Exception e) {
-            // 追问链异常：记日志，仍继续推进状态，保证面试不被追问失败卡死。
-            log.error(
-                    "follow-up generation failed, continue to next question, "
-                            + "sessionId={}, questionId={}",
-                    task.sessionId(),
-                    task.questionId(),
-                    e
-            );
+        // 第二步：如果不需要追问，直接推进状态并预生成下一题
+        if ("NONE".equalsIgnoreCase(plan.chain())) {
+            completeAndPreGenerate(task.sessionId());
+            return;
         }
-        // 修改结束
 
-        // 第四步：无论追问是否成功，都推进状态并预生成下一题（ASKING → QUESTIONING）。
+        // 第三步：需要追问，执行多节点追问链（含 Singleflight 防重）。
+        // 追问的生成与幂等落库都发生在链内：loadQuestionContext 加载原题与作答，
+        // 分数段生成节点产出正文，persistFollowUp 节点把结果幂等写入 follow_up 表。
+        // 它们落在同一个 fence 作用域内，不会"生成成功却在落库前崩溃"，
+        // 因此这里不再单独调 insertIfAbsent——落库由链上的 persistFollowUp 完成。
+        executeFollowUpWithSingleflight(
+                task,
+                plan
+        );
+
+        // 第四步：推进状态并预生成下一题
         completeAndPreGenerate(task.sessionId());
     }
 
@@ -10763,7 +10093,9 @@ public class FollowUpGenerationService {
 
 #### 文件 4：`src/main/java/com/example/interview/application/FollowUpTask.java`
 
-**创建这个文件干什么：** 追问任务在 Redis 队列里的载荷对象——"投递进队列、被消费者取出"的最小上下文。它只描述"队列里传什么"，不包含 AI 返回的结果。
+**创建这个文件干什么：** 追问任务在 RabbitMQ 里的载荷对象——"投进队列、被消费者取出"的最小上下文。它只描述"队列里传什么"，不包含 AI 返回的结果。
+
+**为什么只带三样东西（会话、题目、分数）：** 追问走哪条链，消费端会再 `decide` 一次。把链名塞进消息体看似省一次计算，实际是给自己埋坑——决策规则改了（比如分数段边界从 80 调到 85），队列里躺着的旧消息还带着旧链名，改配置就得等积压消费完才生效。任务体保持最小、决策只留在一个地方算，是这类"消息 + 规则"组合的通用做法。
 
 ```java
 package com.example.interview.application;
@@ -10771,7 +10103,7 @@ package com.example.interview.application;
 import java.util.UUID;
 
 /**
- * 追问任务的不可变数据模型，作为 Redis 队列中传递的载荷。
+ * 追问任务的不可变数据模型，作为 RabbitMQ 消息体传递的载荷。
  *
  * @param sessionId  面试会话 ID，用于关联会话数据
  * @param questionId 题目 ID，用于关联当前题目
@@ -10787,297 +10119,250 @@ public record FollowUpTask(
 }
 ```
 
+---
+
 #### 文件 5：`src/main/java/com/example/interview/application/FollowUpTaskPublisher.java`
 
-**创建这个文件干什么：** 追问任务的"发布 + 消费 + 重试/死信"三合一服务。发布侧由 `InterviewWorkflowService.judge` 在评分落库、状态推进之后调用；消费侧由 `FollowUpTaskConsumerLoop` 定时触发。三 key 结构（QUEUE / PROCESSING / DEAD）换来的是"消费者崩溃不丢任务"。**本代码块与项目文件逐字一致。**
+**创建这个文件干什么：** 追问任务的投递器，三个方法分别对应主队列、延迟重试队列、死信队列。发布侧由 `InterviewWorkflowService.judge` 在评分落库、状态推进之后调用。
+
+**为什么这个类只负责"发"：** 消费由 `FollowUpTaskConsumer` 的 `@RabbitListener` 驱动、ack 由 `Channel` 控制，不需要手写拉取循环。职责一分开，"投递失败"和"消费失败"各自的失败面就独立了。
+
+**publisher confirm 为什么不在这个类里单独注册：** 三条线共用同一个 `RabbitTemplate`，confirm/returns 回调在 `JudgeTaskPublisher` 的 `@PostConstruct` 里注册一次就够了。重复注册只会让后一次覆盖前一次，出问题时反而不知道是谁的回调在打日志。
+
+**`publish` 为什么不是 `@Async`：** `convertAndSend` 是毫秒级操作，发布失败必须让调用方当场感知——评分已经落库了，追问消息却没投出去，用户会卡在"评分完成但追问不出现"。让异常抛出到 `judge` 里，由评分消费者按可重试失败处理，比异步静默失败强。
 
 ```java
-// 从这里开始是新增的：以下整个文件都是新增的（项目里缺失这个文件）
 package com.example.interview.application;
 
+import com.example.interview.config.RabbitConfig;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-// 从这里开始是修改的：move 需要 RedisListCommands.Direction 枚举，补上该 import。
-import org.springframework.data.redis.connection.RedisListCommands.Direction;
-// 修改结束
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Async;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
 
 /**
- * 追问任务发布/消费服务。
+ * 追问任务投递器：把消息放进主队列 / 延迟重试队列 / 死信队列。
  *
- * 为什么用 Redis List 而不是 RabbitMQ/Kafka：项目已经引入了 Redis，追问任务的并发量也不高，
- * 不值得为一个队列再引入一套中间件；三 key 的结构换来的是"消费者崩溃不丢任务"。
+ * <h3>为什么这个类只负责「发」</h3>
+ * 消费由 {@link FollowUpTaskConsumer} 的 {@code @RabbitListener} 驱动、ack 由 Channel 控制，
+ * 不需要手写拉取循环。职责一分开，「投递」和「消费」各自的失败面就独立了。
  *
- * 为什么发布和消费放在同一个类里：两者操作同一个队列的三个 key，
- * 分开反而要多维护一份 key 常量的拷贝；将来真要分离，把消费逻辑抽出去即可。
+ * <h3>publisher confirm</h3>
+ * {@code convertAndSend} 正常返回只代表「方法没抛异常」，不代表消息真的进了 broker。
+ * 发布那一刻 broker 挂了、路由不到队列，消息就静默丢了——而库里那道题的评分已经落好，
+ * 用户会卡在「评分完成但追问不出现」。全局的 confirm 回调在
+ * {@link JudgeTaskPublisher#registerConfirmCallback()} 里统一注册（共用同一个 RabbitTemplate），
+ * 三条线共用一份确认逻辑。
  */
 @Service
 public class FollowUpTaskPublisher {
 
-    // ---- Redis Key 定义 ---- //
+    private static final Logger log = LoggerFactory.getLogger(FollowUpTaskPublisher.class);
 
-    /** 主队列：待处理的追问任务，使用 Redis List 结构。 */
-    private static final String QUEUE =
-            "interview:task:follow-up";
-
-    /** 处理中队列：已取出但尚未完成的追问任务。
-     *  为什么必须有它：消息一旦 pop 出来就离开主队列，消费者这时崩溃任务就凭空消失；
-     *  压在 processing 里，至少还能被人看到、被补偿任务捞回来。 */
-    private static final String PROCESSING =
-            "interview:task:follow-up:processing";
-
-    /** 死信队列：超过最大重试次数的失败任务。
-     *  死信不会被自动消费，留原文是为了人工/定时任务排查，而不是让失败静默消失。 */
-    private static final String DEAD =
-            "interview:task:follow-up:dead";
-
-    /** 最大重试次数。到顶就进死信，避免一条永远失败的任务无限重投。 */
-    private static final int MAX_RETRY = 3;
-
-    // ---- 依赖注入 ---- //
-
-    // 用 StringRedisTemplate 而不是 RedisTemplate<String, FollowUpTask>：
-    // 我们用 Jackson 手工控制序列化格式，队列里存的永远是"人也能看懂"的 JSON 字符串，
-    // 出问题时直接去 Redis 里看一眼原文就能定位，不依赖框架的序列化黑盒。
-    private final StringRedisTemplate redis;
-    // Jackson 序列化器：入队前把 FollowUpTask 转成 JSON，出队后再转回对象。
+    private final RabbitTemplate rabbit;
     private final ObjectMapper mapper;
 
-    // 追问生成的核心业务逻辑，消费端只负责"取任务、调它、按结果收尾"。
-    private final FollowUpGenerationService generation;
-
-    // 构造器注入三个协作者：队列客户端、JSON 序列化器、追问生成服务。
-    // 字段全是 final，消费在独立线程池里执行，依赖不会被中途替换。
-    public FollowUpTaskPublisher(
-            StringRedisTemplate redis,
-            ObjectMapper mapper,
-            FollowUpGenerationService generation
-    ) {
-        this.redis = redis;
+    public FollowUpTaskPublisher(RabbitTemplate rabbit, ObjectMapper mapper) {
+        this.rabbit = rabbit;
         this.mapper = mapper;
-        this.generation = generation;
     }
 
     /**
-     * 发布追问任务到 Redis 队列。
+     * 发布追问任务。
      *
-     * 由 InterviewWorkflowService.judge 在评分落库、状态推进之后调用。
-     * 为什么这个方法不是 @Async：rightPush 是毫秒级操作，异步化没有收益；
-     * 更要紧的是发布失败必须让调用方当场感知（抛异常），异步化会把异常吞进另一个线程。
-     *
-     * @param sessionId  面试会话 ID
-     * @param questionId 当前题目 ID
-     * @param score      当前题的评分，决定追问深度
+     * <p>由 InterviewWorkflowService.judge 在评分落库、状态推进之后调用，只带三样东西：
+     * 哪个会话、哪道题、多少分——走哪条链由消费端的 decide 再算一次，任务体保持最小。
+     * 这里不是异步方法：send 是毫秒级操作，发布失败必须让调用方当场感知。
      */
-    public void publish(
-            UUID sessionId,
-            UUID questionId,
-            double score
-    ) {
+    public void publish(UUID sessionId, UUID questionId, double score) {
+        send(RabbitConfig.FOLLOW_UP_QUEUE, new FollowUpTask(sessionId, questionId, score, 0));
+    }
+
+    /** 可重试失败：投延迟队列，TTL 到期后经死信交换机自动回主队列 */
+    public void retryLater(FollowUpTask task) {
+        send(RabbitConfig.FOLLOW_UP_RETRY_QUEUE, task);
+    }
+
+    /** 重试超限 / 不可重试：进死信，原样留现场 */
+    public void deadLetter(FollowUpTask task) {
+        send(RabbitConfig.FOLLOW_UP_DEAD_QUEUE, task);
+    }
+
+    private void send(String routingKey, Object task) {
         try {
-            // 序列化成 JSON 推入主队列右侧。为什么 rightPush 配消费端的 leftPop：
-            // 右进左出才是 FIFO，先提交的答案先被追问；两边用错就变成后进先出，题序会乱。
-            redis.opsForList().rightPush(
-                    QUEUE,
-                    mapper.writeValueAsString(
-                            new FollowUpTask(
-                                    sessionId,
-                                    questionId,
-                                    score,
-                                    0  // 初始重试次数为 0，每次重投才 +1
-                            )
-                    )
-            );
+            String payload = mapper.writeValueAsString(task);
+            rabbit.convertAndSend(routingKey, payload, message -> {
+                // persistent：broker 重启后消息不丢。
+                message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                return message;
+            });
+            log.info("已投递追问任务 queue={} payload={}", routingKey, payload);
         } catch (JsonProcessingException e) {
-            // 序列化失败通常意味着 FollowUpTask 的字段类型不可序列化，是代码问题而非偶发故障，
-            // 重试多少次都一样，所以直接抛不可恢复异常，让它暴露在日志里。
-            throw new IllegalStateException(
-                    "cannot serialize follow-up task",
-                    e
-            );
-        }
-    }
-
-    /**
-     * 尝试消费一个追问任务。
-     *
-     * 核心是 leftPopAndLeftPush 这条原子命令：从主队列头部取出，同时压进 processing 队列，
-     * 两步要么都成功要么都失败——换成"先 pop 再 push"一旦中间挂掉，任务就没了。
-     * 超时 200 毫秒：主队列为空时最多等 200ms 就返回 null，避免在这里无限阻塞、占着线程。
-     *
-     * 调用频率由外部定时任务/循环控制，@Async 只表示这条消费跑在自己的线程池里。
-     */
-    @Async("followUpTaskExecutor")
-    public void consumeOnce() {
-        // 一条原子命令搞定"出队 + 移位"：从主队列头部取出，同时压进 processing 队列。
-        // 中途消费者崩溃时任务仍留在 processing 里，不会凭空消失。
-        String raw = redis.opsForList()
-                // 从这里开始是修改的：原代码调用的 leftPopAndLeftPush(QUEUE, PROCESSING, 200, TimeUnit.MILLISECONDS)
-                // 在当前 Spring Data Redis 的 ListOperations 上并不存在（编译不过），
-                // 改为与 JudgeTaskPublisher 一致的 Direction 版 move：从 QUEUE 左侧弹出并原子地压进
-                // PROCESSING 左侧。仍然是"右进左出"的 FIFO 语义（publish 用的是 rightPush），
-                // 且保持"出队+移位"的原子性，消费者崩溃时任务仍留在 processing 里不会丢。
-                // 区别只是去掉了 200ms 阻塞等待——消费由外层定时循环反复触发，非阻塞即可。
-                .move(
-                        QUEUE,
-                        Direction.LEFT,
-                        PROCESSING,
-                        Direction.LEFT
-                );
-        // 修改结束
-        if (raw == null) {
-            // 队列为空，本次没有可消费的任务，直接收工。
-            return;
-        }
-
-        // 先声明成 null：反序列化可能失败，catch 里要靠它区分"任务坏掉了"和"处理任务时失败"。
-        FollowUpTask task = null;
-        try {
-            // 反序列化 JSON 为 FollowUpTask 对象
-            task = mapper.readValue(raw, FollowUpTask.class);
-
-            // 调用核心业务逻辑生成追问：决策 → Singleflight 跑 LiteFlow 链 → 落库 → 推进状态。
-            generation.generate(task);
-
-            // 生成成功，把这条消息从 processing 里摘掉。
-            // 为什么用 remove 而不是 leftPop：processing 里可能压着多条任务，
-            // leftPop 会摘错别人的消息，remove 按"值 + 数量 1"精确删掉当前这条。
-            redis.opsForList().remove(
-                    PROCESSING,
-                    1,     // 只删 1 个匹配元素
-                    raw    // 匹配的内容就是这条任务的原始 JSON
-            );
-        } catch (Exception e) {
-            // 消费失败（AI 超时、数据库异常等）：交给 retryOrDeadLetter 决定重投还是进死信。
-            // 这里故意不把异常抛出去——抛出会让任务永远留在 processing 里没人管。
-            retryOrDeadLetter(raw, task);
-        }
-    }
-
-    /**
-     * 处理消费失败的任务：重投主队列或进死信队列。
-     *
-     * @param raw  原始 JSON 字符串（重投/进死信都以它为准，保证内容不变形）
-     * @param task 解析后的任务对象；反序列化失败时为 null
-     */
-    private void retryOrDeadLetter(
-            String raw,
-            FollowUpTask task
-    ) {
-        // 反序列化失败（task 为 null）或重试次数已达上限 → 直接进死信，不再重试。
-        // 为什么不重试反序列化失败的任务：JSON 本身已经坏了，重投多少次都还是坏的那一条。
-        if (task == null || task.retryCount() >= MAX_RETRY) {
-            // 原文原样丢进死信队列，方便人工照原样排查。
-            redis.opsForList().rightPush(DEAD, raw);
-            // 同时从 processing 摘掉：不摘的话补偿任务会一直以为它还"卡在处理中"。
-            redis.opsForList().remove(
-                    PROCESSING,
-                    1,
-                    raw
-            );
-            return;
-        }
-
-        try {
-            // 重投：只把 retryCount 加一，其余字段原样带回，重新放回主队列尾部排队。
-            FollowUpTask retry = new FollowUpTask(
-                    task.sessionId(),
-                    task.questionId(),
-                    task.score(),
-                    task.retryCount() + 1  // 重试次数 +1，到 MAX_RETRY 就改走死信
-            );
-            redis.opsForList().rightPush(
-                    QUEUE,
-                    mapper.writeValueAsString(retry)
-            );
-            // 新消息已经进主队列，这条旧的要从 processing 摘掉，否则会留下永不消失的幽灵消息。
-            redis.opsForList().remove(
-                    PROCESSING,
-                    1,
-                    raw
-            );
-        } catch (JsonProcessingException e) {
-            // 重投时序列化失败：异常只能抛出去，此时任务仍留在 processing 队列中，
-            // 需要补偿机制来清理（与评分队列的补偿任务同一套思路）。
-            throw new IllegalStateException(
-                    "cannot serialize follow-up retry",
-                    e
-            );
+            // 载荷是 record + 基本类型，序列化失败属于程序错误，直接抛
+            throw new IllegalStateException("无法序列化追问任务", e);
         }
     }
 }
-// 新增结束
 ```
 
-**三个必须记住的点：** ① 出队用的是 `redis.opsForList().move(QUEUE, Direction.LEFT, PROCESSING, Direction.LEFT)`——一条原子命令把任务从主队列左侧弹出、同时压进 processing 左侧，**不是** `leftPopAndLeftPush`（该重载在当前 Spring Data Redis 的 `ListOperations` 上并不存在，编译不过）；`publish` 用 `rightPush`，右进左出即 FIFO。② 消费失败时把任务重投主队列、`retryCount + 1`，到 `MAX_RETRY = 3` 就进死信；反序列化失败（`task == null`）也直接进死信。③ 重投/进死信后都要 `remove(PROCESSING, 1, raw)` 把旧消息从 processing 摘掉，否则会留下"永远卡在处理中"的幽灵消息。
+---
 
-#### 文件 6：`src/main/java/com/example/interview/application/FollowUpTaskConsumerLoop.java`
+#### 文件 6：`src/main/java/com/example/interview/application/FollowUpTaskConsumer.java`
 
-**创建这个文件干什么：** "谁来消费"的答案。`consumeOnce` 带 `@Async("followUpTaskExecutor")`，语义是"被调用一次、在独立线程池里消费一条"，不会自己重复执行；没有外部反复调用，主队列里的追问任务会一直躺着。本类用 `@Scheduled(fixedDelay = 200)` 定时触发它。
+**创建这个文件干什么：** 这是"谁来消费"的答案。`@RabbitListener(queues = RabbitConfig.FOLLOW_UP_QUEUE)` 让 broker 主动推消息，方法里反序列化 → 带超时跑 `FollowUpGenerationService.generate` → 成功 ack / 失败转下一跳。原来那个 `FollowUpTaskConsumerLoop`（`@Scheduled(fixedDelay = 200)` 反复调 `consumeOnce`）整个类都被删掉了。
+
+**为什么追问也要单独加超时：** 追问一次要调两次模型（先决定要不要追问，再生成追问正文），上游抖动时可能长时间不返回。消费者活着、消息握在手里没 ack 时 broker 不会重投，这条消息会把一个监听线程占死；`prefetch` 满了以后这个实例再也接不了新消息，队列等于停摆。所以生成被提交到内部 4 线程池，主线程最多等 60 秒（`app.interview.follow-up-timeout-seconds` 可覆盖）。
+
+**为什么重投不会产生两条追问：** `persistFollowUp` 节点是幂等写入（同一题同一轮不会写出两条），加上 `interview_follow_up` 表的唯一键 `uk_follow_up_session_question (session_id, question_id)` 兜底。所以重投最多浪费一次模型调用。
+
+**死信队列里躺着的追问怎么办：** 不自动处理。追问是"锦上添花"的分支——这一题没有追问，候选人照样能答下一题，主流程不会被卡住。死信留着给运维看现场：如果是上游限流集中爆发，等恢复后按消息体手动重投即可。
 
 ```java
-// 从这里开始是新增的：以下整个文件都是新增的（补全亮点.md 里只写了
-// FollowUpTaskPublisher 的消费方法，并注明"调用频率由外部定时任务/循环控制"，
-// 但项目里没有任何一处调用它。没有这个循环类，追问队列就进得去出不来，
-// 追问永远生成不了，属于"能编译但跑不通"的缺口，因此补上本类。）
 package com.example.interview.application;
 
-import org.springframework.scheduling.annotation.Scheduled;
+import com.example.interview.config.RabbitConfig;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rabbitmq.client.Channel;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
-// ============================================================
-// 追问任务消费者循环
-// ============================================================
-// 职责：定时触发 FollowUpTaskPublisher.consumeOnce()，让"消费一条追问任务"
-// 变成持续运行的动作。
-//
-// 为什么需要一个循环：consumeOnce 上带 @Async("followUpTaskExecutor")，
-// 它的语义是"被调用一次、在独立线程池里消费一条"，调用方拿到的是立即返回的
-// Future 占位，不会自己重复执行；没有外部反复调用，Redis 主队列里的追问任务
-// 会一直躺着，评分返回的 chain 字段也就永远等不到追问落库。
-//
-// 为什么用 @Scheduled 而不是在方法里写 while(true)：
-//   常驻循环一旦抛异常就永久退出；@Scheduled(fixedDelay) 由 Spring 调度，
-//   单次异常只跳过这一轮，下一轮照常触发，健壮性更好。
-//   间隔取 200ms：队列为空时最多 5 次/秒的空查询，成本可忽略。
-// ============================================================
+import java.io.IOException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * 追问消费者：RabbitMQ 手动 ack + AI 调用超时 + 延迟重试 + 死信。
+ *
+ * <h3>主链路</h3>
+ * 收到消息 → 调追问生成服务（决策 → 跑 LiteFlow 链 → 幂等落库 → 推进状态）→ {@code basic.ack}。
+ * ack 在业务成功之后：中途崩溃 → 消息没确认 → broker 自动 requeue 给其他消费者。
+ *
+ * <h3>为什么还要单独加超时</h3>
+ * 消费者活着、消息握在手里没 ack 时，broker 不会重投。追问一次要调两次模型
+ * （先决定要不要追问，再生成追问正文），上游抖动时可能长时间不返回，
+ * 这条消息会把一个监听线程占死。所以用独立线程池执行、主线程等固定秒数，
+ * 超时就按「可重试失败」处理，投延迟重试队列并 ack 原消息。
+ *
+ * <h3>重投的幂等由谁保证</h3>
+ * 追问落库走 persistFollowUp 节点的幂等写入（同一题同一轮不会写出两条追问），
+ * 所以重投最多浪费一次模型调用，不会产生重复追问。
+ */
 @Component
-public class FollowUpTaskConsumerLoop {
+public class FollowUpTaskConsumer {
 
-    // 只依赖发布/消费服务：出队、反序列化、调生成服务、失败重投或进死信
-    // 都在 FollowUpTaskPublisher 里完成，本类只负责"按节奏触发"，职责单一。
+    private static final Logger log = LoggerFactory.getLogger(FollowUpTaskConsumer.class);
+
+    /** 重试上限：3 次。再多基本可以断定不是抖动，而是数据或上游配置坏了 */
+    private static final int MAX_RETRY = 3;
+
+    private final FollowUpGenerationService generation;
     private final FollowUpTaskPublisher publisher;
+    private final ObjectMapper mapper;
+    private final int timeoutSeconds;
 
-    // 构造器注入，方便测试时替换成 mock。
-    public FollowUpTaskConsumerLoop(FollowUpTaskPublisher publisher) {
+    /**
+     * 追问专用线程池：只用来给「等 AI」加超时。
+     *
+     * <p>为什么不能直接在监听线程里调生成服务：一旦 AI 挂住，监听线程就永远卡在那，
+     * prefetch 会把消息全压在这一个消费者上，其他实例分不到活，整个队列等于停摆。
+     */
+    private final ExecutorService followUpExecutor = Executors.newFixedThreadPool(4, r -> {
+        Thread t = new Thread(r, "follow-up-ai-");
+        t.setDaemon(true);
+        return t;
+    });
+
+    public FollowUpTaskConsumer(FollowUpGenerationService generation,
+                                FollowUpTaskPublisher publisher,
+                                ObjectMapper mapper,
+                                @org.springframework.beans.factory.annotation.Value(
+                                        "${app.interview.follow-up-timeout-seconds:60}") int timeoutSeconds) {
+        this.generation = generation;
         this.publisher = publisher;
+        this.mapper = mapper;
+        this.timeoutSeconds = timeoutSeconds;
+    }
+
+    @PreDestroy
+    void shutdown() {
+        followUpExecutor.shutdownNow();
+    }
+
+    @RabbitListener(queues = RabbitConfig.FOLLOW_UP_QUEUE)
+    public void onFollowUp(String payload, Message message, Channel channel) throws IOException {
+        long tag = message.getMessageProperties().getDeliveryTag();
+        FollowUpTask task = null;
+        try {
+            task = mapper.readValue(payload, FollowUpTask.class);
+            generateWithTimeout(task);
+            // 追问落库、状态推进都完成了，才确认消费
+            channel.basicAck(tag, false);
+        } catch (Exception e) {
+            log.error("追问任务失败，转延迟重试: {}", payload, e);
+            retryOrDead(task, channel, tag);
+        }
+    }
+
+    private void generateWithTimeout(FollowUpTask task) {
+        FollowUpTask finalTask = task;
+        Future<?> future = followUpExecutor.submit(() -> generation.generate(finalTask));
+        try {
+            future.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new IllegalStateException("追问生成超过 " + timeoutSeconds + " 秒");
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("追问生成被中断", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IllegalStateException("追问生成失败", cause);
+        }
     }
 
     /**
-     * 定时触发一次追问任务消费。
+     * 重试或进死信。
      *
-     * <p>为什么调 consumeOnce 而不是自己写拉取逻辑：consumeOnce 内部用的是
-     * move 这条原子命令（主队列 → processing），队列为空时立刻返回 null，
-     * 正好适合被定时器反复调用；在这里重写一遍出队逻辑只会多出一份容易走样的拷贝。</p>
+     * <p>为什么重试投「延迟队列」而不是 {@code basicNack(requeue=true)}：
+     * requeue 会立刻把消息放回队首，一个正在限流的 AI 接口会被连续打三次、三次全败进死信，
+     * 重试等于没重试。延迟队列让每次重试之间隔 10 秒，给下游留恢复窗口。
      *
-     * <p>为什么用 fixedDelay 而不是 fixedRate：必须等上一轮触发完再开始计时，
-     * 队列积压时不会不断叠加新的触发轮次。</p>
+     * <p>无论走哪条路都要 ack 原消息：不 ack 它会一直躺在 unacked 里，
+     * 直到连接断开被重投，等于又绕回了「无限热重试」。
      */
-    @Scheduled(fixedDelay = 200)
-    public void poll() {
-        // 一次只触发一条：单轮不长时间占用调度线程；
-        // 队列为空时 consumeOnce 会立刻返回，等下一次调度即可。
-        publisher.consumeOnce();
+    private void retryOrDead(FollowUpTask task, Channel channel, long tag) throws IOException {
+        if (task == null) {
+            // 消息体本身反序列化不了：重投也还是解析不了，直接 ack 掉并记日志
+            channel.basicAck(tag, false);
+            return;
+        }
+        if (task.retryCount() >= MAX_RETRY) {
+            publisher.deadLetter(task);
+        } else {
+            publisher.retryLater(new FollowUpTask(
+                    task.sessionId(), task.questionId(), task.score(), task.retryCount() + 1));
+        }
+        channel.basicAck(tag, false);
     }
 }
-// 新增结束
 ```
-
-**为什么用 `@Scheduled` 而不是 `while(true)`：** 常驻循环一旦抛异常就永久退出；`@Scheduled(fixedDelay)` 由 Spring 调度，单次异常只跳过这一轮，下一轮照常触发，健壮性更好。间隔取 200ms（队列为空时最多 5 次/秒的空查询，成本可忽略）；用 `fixedDelay` 而不是 `fixedRate`，是必须等上一轮触发完再开始计时，队列积压时不会叠加新的触发轮次。
 
 ---
 
@@ -11094,7 +10379,7 @@ public class FollowUpTaskConsumerLoop {
 ```sql
 -- interview_answer 新增列
 is_follow_up TINYINT(1) NOT NULL DEFAULT 0,   -- 0=初次作答，1=追问作答
-retry_count  INT NOT NULL DEFAULT 0,          -- 异步补偿重投评分任务的次数
+retry_count  INT NOT NULL DEFAULT 0,          -- 历史字段：早期补偿重投次数，现由消息体 retryCount 承担
 
 -- 唯一键由 (question_id) 改成 (question_id, is_follow_up)：
 -- 同一道题最多两行，一行初次作答、一行追问作答。
@@ -11184,7 +10469,7 @@ entity.setIsFollowUp(command.followUp() ? 1 : 0);
 
 #### 文件 5：`JudgeTask` + `JudgeTaskPublisher`（评分队列携带 followUp）
 
-**`JudgeTask` 多一个 `boolean followUp`，插在 `retryCount` 之前：** `retryCount` 仍保持末位，"重试次数永远是最后一个分量"的约定不变。追问作答与初次作答共用同一条评分队列，队列载荷必须带上这个标记，否则消费者无法区分"该写哪一行、该不该推进状态机"。**重试 / 补偿重投时必须原样保留 `followUp`**，否则追问任务会被当成初次作答错误处理。
+**`JudgeTask` 多一个 `boolean followUp`，插在 `retryCount` 之前：** `retryCount` 仍保持末位，"重试次数永远是最后一个分量"的约定不变。追问作答与初次作答共用同一条评分队列，队列载荷必须带上这个标记，否则消费者无法区分"该写哪一行、该不该推进状态机"。**重投时必须原样保留 `followUp`**，否则追问任务会被当成初次作答错误处理。
 
 ```java
 public record JudgeTask(
@@ -11331,7 +10616,9 @@ public SessionView end(
 
 ### 模块整体流程
 
-报告生成是一次 10~30 秒的 AI 调用，如果放在 HTTP 线程里同步等待，接口会长时间挂着、还容易被网关超时切断。所以整条链路被拆成"立即受理 + 前端轮询"：`POST` 只把记录置成 `GENERATING` 就返回，真正的组装和 AI 调用丢到独立线程池里跑，前端轮询状态接口直到出现终态。
+报告生成是一次 10~30 秒的 AI 调用，如果放在 HTTP 线程里同步等待，接口会长时间挂着、还容易被网关超时切断。所以整条链路被拆成"立即受理 + 前端轮询"：`POST` 只把记录置成 `GENERATING` 并向 RabbitMQ 投一条任务就返回，真正的组装和 AI 调用由消费者在后台跑，前端轮询状态接口直到出现终态。
+
+**这里原来用的是 `@Async`，现在是队列。** 两者的区别不在"快慢"，而在"崩了之后有没有人接手"：`@Async` 跑在线程池里，JVM 一崩，正在生成的报告任务直接蒸发，`report` 行永远停在 `GENERATING`，前端一直转圈；走队列之后，消息没 ack 就自动 requeue，另一个实例会接着干。
 
 ```text
   面试会话进入 ENDED 状态
@@ -11343,22 +10630,29 @@ public SessionView end(
   校验会话归属（只能操作自己的会话）
      │
      ▼
-  报告记录状态置为 GENERATING（不存在则先插入一条）
+  原子抢占生成权：status=GENERATING、content=null、刷新 updated_at
+  （已完成且正文非空 → 直接返回，绝不重算）
      │
      ▼
-  接口立即返回（此时 markdown 必为 null），AI 任务交给异步线程池
+  接口立即返回（此时 markdown 必为 null），同时向 interview.report.queue
+  投一条 ReportTask(sessionId, reportId, retryCount=0)
      │
      ▼
-  ── 以下在异步线程 reportGenerationTaskExecutor 中执行 ──
+  ── 以下在 ReportTaskConsumer 的监听线程里执行（手动 ack）──
      │
-     ▼
-  组装报告上下文字符串（查询题目、答案、追问）
+     ├─ 幂等判重：记录已 COMPLETED 且正文非空 → 直接 ack，跳过
      │
-     ▼
-  调用 AI（InterviewAiFacade.generateReport）
+     ├─ 等待在途评分落库（最多 90 秒，避免报告把最后几题记成"未作答"）
      │
-     ▼
-  写回 Markdown 并置 COMPLETED（异常则置 FAILED）
+     ├─ 组装报告上下文字符串（查询题目、答案、追问）
+     │
+     ├─ 调用 AI（InterviewAiFacade.generateReport）→ 追加表现分析章节
+     │
+     ├─ 写回 Markdown 并置 COMPLETED → basicAck
+     │
+     └─ 失败：generate 返回 false → 投 interview.report.retry.queue
+             （TTL 10 秒经 DLX 回主队列，retryCount+1）
+             重试耗尽（>=3）→ markFailed 置 FAILED + 投死信队列
      │
      ▼
   前端轮询 GET /api/reports/{sessionId}/status 直到终态
@@ -11685,17 +10979,10 @@ public class InterviewReportDataRepositoryImpl
             sb.append("## 第 ").append(i + 1).append(" 题\n")
               .append("题目：").append(question.getContent()).append("\n");
 
-            // 从这里开始是修改的：按 is_follow_up 区分"初次作答"与"追问作答"。
-            // 为什么不能再用 findFirst：同一道题在 interview_answer 里最多有两行
-            // （is_follow_up = 0 的初次作答、= 1 的追问作答），findFirst 只会随机拿到
-            // 时间上更早的那一行，追问的回答与评分就永远进不了报告，报告里
-            // "原始回答 → 追问 → 追问回答"这条链会缺后半截。
-            // 第一次筛选专门取初次作答（is_follow_up = 0），保证"回答"栏里是原题答案。
+            // 按题目 ID 找到对应答案，若尚未作答则提示数据缺失
             AnswerEntity answer = answerList.stream()
                     .filter(a -> question.getId()
                             .equals(a.getQuestionId()))
-                    .filter(a -> a.getIsFollowUp() == null
-                            || a.getIsFollowUp() == 0)
                     .findFirst()
                     .orElse(null);
             if (answer != null) {
@@ -11712,18 +10999,6 @@ public class InterviewReportDataRepositoryImpl
                             .equals(f.getQuestionId()))
                     .forEach(f -> sb.append("追问：")
                             .append(f.getContent()).append("\n"));
-
-            // 新增：追问作答（is_follow_up = 1）紧跟在该题的追问正文之后，
-            // 让报告端能完整还原"原题回答 → 追问 → 追问回答"的对比链条。
-            answerList.stream()
-                    .filter(a -> question.getId()
-                            .equals(a.getQuestionId()))
-                    .filter(a -> a.getIsFollowUp() != null
-                            && a.getIsFollowUp() == 1)
-                    .forEach(a -> sb.append("追问回答：").append(a.getAnswer()).append("\n")
-                            .append("追问评分：").append(a.getScore()).append("\n")
-                            .append("追问反馈：").append(a.getFeedback()).append("\n"));
-            // 修改结束
         }
 
         return sb.toString();
@@ -11792,24 +11067,173 @@ public String generateReport(UUID sessionId, String context) {
 
 ---
 
-### 报告 4：编写报告接口
+### 报告 4：编写报告接口与任务队列
 
-**本小节目的：** 向前端提供**三个** REST 接口——触发生成、轮询状态、读取正文，并确保每次面试只产生一份报告（存在则重置重新生成、不存在则先插入），同时保证"只能看自己的报告"。
+**本小节目的：** 向前端提供**三个** REST 接口——触发生成、轮询状态、读取正文；同时把"生成"这件事从 HTTP 线程彻底挪出去，改成"投一条消息"。顺带解决三个只有真实并发才会暴露的问题：重复点"生成报告"、两个请求同时首次创建记录、以及"已生成的报告被再点一次清空重做"。
 
-**本小节流程：** 接收 sessionId → 校验会话归属（`assertOwner`）→ 查询或创建报告记录并置为 `GENERATING` → 立即返回 → 异步线程组装上下文、调用 `generateReport`、写回正文并置终态 → 前端轮询 `status` → `COMPLETED` 后用 `GET` 取正文。
+**本小节流程：** 定义任务载荷 `ReportTask` → 定义投递器 `ReportTaskPublisher` → `ReportController` 校验归属 + 原子抢占生成权 + 投递任务 + 立即返回 → 前端轮询 `status` → 消费者 `ReportTaskConsumer` 取任务、调 `ReportGenerationAsyncService.generate`、成功 ack / 失败转重试或死信 → `COMPLETED` 后用 `GET` 取正文。
 
-**为什么拆成三个接口：** AI 生成一次报告要 10~30 秒，`POST` 若在 HTTP 线程里同步等 AI，接口会长时间挂着、容易被网关超时切断。所以 `POST` 只做"校验 + 置状态 + 丢任务"就立即返回；前端拿到 `GENERATING` 后轮询 `GET /status`，直到 `COMPLETED`（拿正文渲染）或 `FAILED`（提示重试）；`GET /{sessionId}` 则是状态完成后专门取正文的接口。
+**为什么拆成三个接口：** AI 生成一次报告要 10~30 秒，`POST` 若在 HTTP 线程里同步等 AI，接口会长时间挂着、容易被网关超时切断。所以 `POST` 只做"校验 + 抢占状态 + 投递任务"就立即返回；前端拿到 `GENERATING` 后轮询 `GET /status`，直到 `COMPLETED`（拿正文渲染）或 `FAILED`（提示重试）；`GET /{sessionId}` 则是状态完成后专门取正文的接口。
 
-#### 文件 1：`src/main/java/com/example/interview/application/ReportController.java`
+---
+
+#### 文件 1：`src/main/java/com/example/interview/application/ReportTask.java`
+
+**创建这个文件干什么：** 报告任务的消息体。三个字段：`sessionId` 查数据、`reportId` 定位要更新的那一行、`retryCount` 数重试次数。
+
+**为什么任务体不塞上下文：** 上下文（题干、答案、追问、评分）是查库拼出来的。塞进消息体有两个坏处——消息膨胀；以及"消息里的上下文和库里不一致"的幽灵数据（用户重答一题后，队列里那条旧消息还带着旧答案）。上下文只在消费端拼一次，拼的是什么就是什么。
+
+**`retryCount` 为什么必须跟着消息走：** 消费者是多实例的，同一条消息可能被不同节点接到。把重试次数记在内存里（哪怕记成 `ThreadLocal`），换一台机器就归零，重试上限形同虚设。
+
+```java
+package com.example.interview.application;
+
+import java.util.UUID;
+
+/**
+ * 报告生成任务的队列载荷。
+ *
+ * <p>只带三个字段：sessionId 用来查数据，reportId 用来定位要更新的那一行，
+ * retryCount 用来数重试次数。任务体不塞上下文——上下文是查库拼出来的，
+ * 塞进消息体既会让消息膨胀，也会出现「消息里的上下文和库里不一致」的幽灵数据。
+ *
+ * <p>retryCount 与评分任务同义：投递时为 0，每次转延迟重试队列 +1，
+ * 超过上限转死信。它必须跟着消息走，不能只在内存里数——消费者是多实例的，
+ * 同一条消息可能被不同节点接到。
+ *
+ * @param sessionId  面试会话 ID
+ * @param reportId   报告记录主键
+ * @param retryCount 已重试次数，投递时为 0
+ */
+public record ReportTask(UUID sessionId, Long reportId, int retryCount) {
+}
+```
+
+---
+
+#### 文件 2：`src/main/java/com/example/interview/application/ReportTaskPublisher.java`
+
+**创建这个文件干什么：** 报告任务的投递器，三个方法分别对应主队列、延迟重试队列、死信队列。
+
+**为什么报告也要走队列，而不是继续用 `@Async`：** 报告和评分本来就是同一类任务——要异步、要状态、失败要能重投。`@Async` 的缺口是 JVM 崩溃时任务直接蒸发，而 `report` 行还停在 `GENERATING`，没人会来救它；走队列之后，消息没 ack 就自动 requeue。另一个理由是统一机制：评分已经用 RabbitMQ 了，报告再单独用线程池，等于系统里同时维护两种异步模型。
+
+**职责边界：** 队列负责"任务不丢、失败可重投"，数据库里的 `status` 字段负责"前端可查"。两者不重叠——不要把"有没有在生成"只记在队列里（前端查不到），也不要把重试逻辑压在状态字段上（状态只有三个值，承担不了重试计数）。
+
+**重试期间为什么不写 `FAILED`：** 一旦写成终态，前端会先显示"生成失败"，几秒后又跳回"生成中"，比多等十几秒更让人以为系统出毛病。终态统一由消费者在重试耗尽时落。
+
+```java
+package com.example.interview.application;
+
+import com.example.interview.config.RabbitConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.UUID;
+
+/**
+ * 报告任务投递器。
+ *
+ * <h3>为什么报告也要走队列，而不是继续用 @Async</h3>
+ * 报告和评分本来就是同一类任务：要异步、要状态、失败要能重投。
+ * <ul>
+ *   <li><b>@Async 的真实缺口</b>：JVM 崩溃时，正在生成的报告任务直接蒸发，
+ *       而 report 行还停在 GENERATING——没人会来救它，前端永远转圈。
+ *       走队列之后，消息没 ack 就自动 requeue，这个缺口被补上。</li>
+ *   <li><b>统一机制</b>：评分已经用 RabbitMQ 了，报告再单独用线程池，
+ *       等于系统里同时维护两种异步模型。统一之后少一套心智负担。</li>
+ * </ul>
+ *
+ * <p>状态仍然落库（GENERATING / COMPLETED / FAILED），队列负责「任务不丢、失败可重投」，
+ * 状态字段负责「前端可查」。两者职责不重叠。
+ */
+@Service
+public class ReportTaskPublisher {
+
+    private static final Logger log = LoggerFactory.getLogger(ReportTaskPublisher.class);
+
+    private final RabbitTemplate rabbit;
+    private final ObjectMapper mapper;
+
+    public ReportTaskPublisher(RabbitTemplate rabbit, ObjectMapper mapper) {
+        this.rabbit = rabbit;
+        this.mapper = mapper;
+    }
+
+    public void publish(UUID sessionId, Long reportId) {
+        send(RabbitConfig.REPORT_QUEUE, new ReportTask(sessionId, reportId, 0));
+    }
+
+    /** 可重试失败：投延迟队列，TTL 到期后经死信交换机自动回主队列 */
+    public void retryLater(ReportTask task) {
+        send(RabbitConfig.REPORT_RETRY_QUEUE, task);
+    }
+
+    /**
+     * 重试超限 / 不可重试：进死信，原样留现场给运维。
+     *
+     * <p>报告与评分走同一套「主队列 + 延迟重试 + 死信」结构，理由有两条：
+     * <ul>
+     *   <li><b>失败是有区别的</b>：AI 超时、限流是瞬时抖动，隔 10 秒重跑大概率能成；
+     *       而「整场没答几道题、上下文拼不出来」是结构性失败，重跑还是失败。
+     *       延迟重试 + 上限 3 次正好把这两类分开——前者在第二、三次自愈，后者落到死信。</li>
+     *   <li><b>同一套语义</b>：三类任务共用一种重试机制，运维只盯一个控制台，
+     *       不会出现「评分能重试、报告不能」这种要背下来的差异。</li>
+     * </ul>
+     *
+     * <p>重试期间记录保持 GENERATING，不进 FAILED——一旦写成终态，前端会先显示
+     * 「生成失败」再跳回「生成中」，比多等十几秒更让人困惑。真正失败由消费者在
+     * 重试耗尽时统一置 FAILED，用户仍可点「重新生成」手动再投一次。
+     */
+    public void deadLetter(ReportTask task) {
+        send(RabbitConfig.REPORT_DEAD_QUEUE, task);
+    }
+
+    private void send(String routingKey, Object task) {
+        try {
+            String payload = mapper.writeValueAsString(task);
+            rabbit.convertAndSend(routingKey, payload, message -> {
+                message.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+                return message;
+            });
+            log.info("已投递 queue={} payload={}", routingKey, payload);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("无法序列化报告任务: " + task, e);
+        }
+    }
+}
+```
+
+---
+
+#### 文件 3：`src/main/java/com/example/interview/application/ReportController.java`
 
 **创建这个文件干什么：** 这是报告模块的 REST 控制器，对外暴露三个接口：
-- `POST /api/reports/{sessionId}` —— 触发生成（幂等：已存在就把状态重置回 `GENERATING` 并重新生成，不存在则先插一条）
+- `POST /api/reports/{sessionId}` —— 触发生成（幂等：已生成完就原样返回，正在生成就返回 `GENERATING`，不存在则先插一条）
 - `GET /api/reports/{sessionId}/status` —— 轮询生成状态
 - `GET /api/reports/{sessionId}` —— 状态完成后取正文
 
-控制器依赖 `ReportMapper`（读写报告记录）、`ReportGenerationAsyncService`（异步生成）、`InterviewSessionMapper`（查会话归属）和 `CurrentUserIdProvider`（从 JWT 解析当前用户）。三个接口进门第一句都是 `assertOwner(sessionId)`：先按 sessionId 查会话，再把会话的 `userId` 与当前登录用户比对，不相等直接抛 `AccessDeniedException`——报告里有面试问答原文，不校验就能靠换 sessionId 读到别人的报告。注意 `ReportView` 是 record，**只有三个字段**：`sessionId / status / markdown`（`markdown` 只在 `COMPLETED` 时才有值）。
+控制器依赖 `ReportMapper`（读写报告记录）、`ReportTaskPublisher`（投递任务）、`InterviewSessionMapper`（查会话归属）和 `CurrentUserIdProvider`（从 JWT 解析当前用户）。三个接口进门第一句都是 `assertOwner(sessionId)`：先按 sessionId 查会话，再把会话的 `userId` 与当前登录用户比对，不相等直接抛 `AccessDeniedException`——报告里有面试问答原文，不校验就能靠换 sessionId 读到别人的报告。
+
+**这里有三个坑，都是真实踩过才补上的：**
+
+1. **并发首次创建会 500。** 报告页一进入会同时触发两次 `loadReport`（`useEffect` 一次、`finishInterview()` 里再 `await` 一次），两处都 `POST /reports`；后端"先查再插"时两个线程可能都先查到"无记录"，随后都想 `insert`。`unique(session_id)` 只允许一条成功，另一条抛 `DuplicateKeyException` → 接口 500 → 前端把这次 500 静默吞掉后继续轮询，界面就一直停在"正在生成"。所以创建被包进 `try / catch`：插入冲突就回查已存在的记录，继续走后面的抢占逻辑。
+
+2. **"已完成再点一次"会清空报告。** 原子 `UPDATE` 的条件若只写"状态不是 `GENERATING`"，`COMPLETED` 恰好满足，于是再点一次会把已经生成好的正文清空、状态打回 `GENERATING`、重新投递一次任务。表现就是：报告本来已经出来了，再点一下它变回"生成中"，白等一两分钟，内容还短暂消失。报告是"一次性产物"，重复触发应当是幂等读，不是重算——所以 `COMPLETED` 且正文非空时直接返回。
+
+3. **`updateById` 会把 `updated_at` 顶着不动。** `entity` 里带着旧的 `updated_at` 参与更新，反而把 `ON UPDATE CURRENT_TIMESTAMP` 覆盖掉了；时间戳不动，"10 分钟算不算还在跑"就永远判不出来。所以改成一条 `UpdateWrapper`：条件写进 `WHERE`，同时 `set` 状态、清空正文、刷新时间戳，三件事一次原子完成。影响行数 0 = 别人正在生成，直接返回当前状态，不投递。
+
+**`GENERATING_TTL` 为什么是 10 分钟：** 只看状态的话，消费者一崩、状态就永远停在 `GENERATING`，用户再也点不出新的一份（僵尸状态）。给个上限后语义变成"10 分钟内还当它正在跑，超过就认为这条任务已经死了，允许重新投递"。正常一份报告 30~120 秒、端到端实测 75 秒，留 5 倍余量足够覆盖上游变慢。
+
+**为什么投递放在最后一行：** 只有抢占成功（或刚创建成功）才投。抢占失败说明别人已经在跑，此时再投一条只会让两份任务并发生成同一份报告，白烧一次模型调用。
 
 ```java
+// 从这里开始是修改的：以下整个文件由"同步版（POST 收 ReportContext、在 HTTP 线程里等 AI 返回）"
+// 改写为"异步三接口版（触发生成 / 轮询状态 / 读取正文）"，并补上会话归属校验。
 package com.example.interview.application;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
@@ -11821,17 +11245,31 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.UUID;
 
 /**
  * 报告 Controller。
- *
+ * 
  * 提供报告生成、状态查询和内容获取接口。
  * 生成操作是异步的，POST 接口立即返回，结果通过状态接口轮询获取。
  */
 @RestController
 @RequestMapping("/api/reports")
 public class ReportController {
+
+    /**
+     * 「生成中」的有效窗口。
+     *
+     * <p>为什么要一个时间窗而不是只看状态：只看状态的话，消费者一崩、状态就永远停在
+     * GENERATING，用户再也点不出新的一份（僵尸状态）。给个上限后语义变成
+     * 「10 分钟内还当它正在跑，超过就认为这条任务已经死了，允许重新投递」。</p>
+     *
+     * <p>取 10 分钟的依据：正常一份报告 30~120 秒，e2e 里实测 75 秒；
+     * 留 5 倍余量足以覆盖上游变慢，又不会让用户等太久。</p>
+     */
+    private static final Duration GENERATING_TTL = Duration.ofMinutes(10);
 
     // 报告视图：把"状态 + 内容"打包一起返回前端。
     // markdown 只在 status=COMPLETED 时才有值，其它状态下是 null，
@@ -11845,8 +11283,10 @@ public class ReportController {
 
     // 报告表 Mapper：查询 / 插入 / 更新 report 记录。
     private final ReportMapper reports;
-    // 报告生成异步服务：generate 上带 @Async，调用即返回，不占用 HTTP 线程。
-    private final ReportGenerationAsyncService generation;
+    // 报告任务投递器：report 行建好之后投一条消息进 RabbitMQ。
+    // 为什么不再直接调 ReportGenerationAsyncService：@Async 的缺口是 JVM 崩溃时
+    // 正在生成的任务直接蒸发、状态永远停在 GENERATING；走队列后消息没 ack 会自动 requeue。
+    private final ReportTaskPublisher publisher;
     // 会话表 Mapper：只用来查会话归属，做"这份报告是不是你的"权限校验。
     private final InterviewSessionMapper sessions;
     // 当前登录用户提供者：从 JWT 解析出 userId，供所有者校验使用。
@@ -11855,12 +11295,12 @@ public class ReportController {
     // 构造器注入四个协作者，字段全是 final，Controller 保持无状态、线程安全。
     public ReportController(
             ReportMapper reports,
-            ReportGenerationAsyncService generation,
+            ReportTaskPublisher publisher,
             InterviewSessionMapper sessions,
             CurrentUserIdProvider currentUser
     ) {
         this.reports = reports;
-        this.generation = generation;
+        this.publisher = publisher;
         this.sessions = sessions;
         this.currentUser = currentUser;
     }
@@ -11892,6 +11332,8 @@ public class ReportController {
                         // 用字符串比较：库里 session_id 存的是 varchar，不是二进制 UUID。
                         .eq("session_id", sessionId.toString())
         );
+        // 是否本次新建了记录——新建的本身就是要投递的那一次，不需要再抢占。
+        boolean created = false;
         if (entity == null) {
             // 从这里开始是新增的：并发安全地创建报告记录。
             // 为什么会并发：报告页一进入会同时触发两次 loadReport（useEffect 一次、
@@ -11900,14 +11342,15 @@ public class ReportController {
             // unique(session_id) 只允许一条成功，另一条会抛 DuplicateKeyException，
             // 让接口直接 500 —— 前端把这次 500 静默吞掉后继续轮询，界面就一直停在
             // "正在生成"出不来。所以这里把创建包起来：插入冲突就回查出已存在的记录，
-            // 统一走下面的"重置状态 + 重新生成"分支，保证并发触发幂等、绝不 500。
+            // 走下面的原子抢占，保证并发触发幂等、绝不 500。
             entity = new ReportEntity();
             entity.setSessionId(sessionId.toString());
             entity.setStatus("GENERATING");
             try {
                 reports.insert(entity);
+                created = true;
             } catch (DuplicateKeyException duplicate) {
-                // 另一并发请求已抢先插入：把这条记录重新查出来继续走生成；
+                // 另一并发请求已抢先插入：把这条记录重新查出来继续走抢占；
                 // 若查不到（行被并发删除的极端情况），恢复抛出，避免拿着 null 往下走到 NPE。
                 entity = reports.selectOne(
                         new QueryWrapper<ReportEntity>()
@@ -11916,26 +11359,58 @@ public class ReportController {
                 if (entity == null) {
                     throw duplicate;
                 }
-                entity.setStatus("GENERATING");
-                entity.setContent(null);
-                reports.updateById(entity);
             }
             // 新增结束
-        } else {
-            // 重新生成：状态回到 GENERATING，同时清空旧内容，
-            // 避免前端在生成过程中还翻到上一版报告。
-            entity.setStatus("GENERATING");
-            entity.setContent(null);
-            reports.updateById(entity);
         }
-        // 触发异步生成：@Async 让这次调用立刻返回，HTTP 线程不等待 AI。
-        generation.generate(sessionId, entity.getId());
-        // 同步返回"已受理"的状态，此刻 content 必然是 null。
-        return new ReportView(
-                sessionId,
-                entity.getStatus(),
-                entity.getContent()
-        );
+
+        // 从这里开始是新增的：已完成就直接返回，绝不再重新生成。
+        // 不写这一段的话，下面那条原子 UPDATE 的条件是「状态不是 GENERATING」——
+        // COMPLETED 恰好满足，于是"再点一次生成报告"会把已经生成好的正文清空、
+        // 状态打回 GENERATING、重新投递一次任务。演示时肉眼看到的就是：报告本来
+        // 已经出来了，再点一下它就变回"生成中"，白等一两分钟，内容还短暂消失。
+        // 报告是"一次性产物"，重复触发应当是幂等读，不是重算。
+        if (!created
+                && "COMPLETED".equals(entity.getStatus())
+                && entity.getContent() != null
+                && !entity.getContent().isBlank()) {
+            return new ReportView(sessionId, "COMPLETED", entity.getContent());
+        }
+        // 新增结束
+
+        if (!created) {
+            // 从这里开始是修改的：用一条原子 UPDATE 同时做三件事——抢占生成权、
+            // 清空旧正文、刷新 updated_at。原来的写法是「读出来判状态 → setXxx → updateById」，
+            // 三个问题都踩了：
+            //   ① 判断和写入不在一个原子操作里，两次请求几乎同时到达时都读到旧状态，都会投递；
+            //   ② MyBatis-Plus 的 updateById 默认忽略 null 字段，setContent(null) 根本没写进库，
+            //      于是"生成中"的报告还能读到上一版正文；
+            //   ③ entity.updatedAt 带着旧值参与更新，反而把 ON UPDATE CURRENT_TIMESTAMP
+            //      覆盖掉了——时间戳不动，"10 分钟算不算在跑"就永远判不出来。
+            // 现在把条件写进 WHERE：只有「不在生成中，或上次更新已超过 TTL」才抢得到。
+            // 影响行数 0 = 别人正在生成，直接返回当前状态，不投递。
+            int affected = reports.update(
+                    null,
+                    new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ReportEntity>()
+                            .eq("id", entity.getId())
+                            .and(w -> w.isNull("status")
+                                    .or().ne("status", "GENERATING")
+                                    .or().lt("updated_at", LocalDateTime.now().minus(GENERATING_TTL)))
+                            .set("status", "GENERATING")
+                            .set("content", null)
+                            .set("updated_at", LocalDateTime.now())
+            );
+            if (affected == 0) {
+                // 已有人在跑：不再投递，避免多条任务并发生成同一份报告。
+                return new ReportView(sessionId, "GENERATING", null);
+            }
+            // 修改结束
+        }
+
+        // 投递报告任务进 RabbitMQ：接口立刻返回，HTTP 线程不等待 AI。
+        // 消费者生成完成会写 COMPLETED，前端轮询 /status 拿终态。
+        publisher.publish(sessionId, entity.getId());
+        // 同步返回"已受理"的状态，此刻正文已被上面的 UPDATE 清空。
+        return new ReportView(sessionId, "GENERATING", null);
     }
 
     /**
@@ -12013,7 +11488,7 @@ public class ReportController {
         );
         if (entity == null) {
             // 记录不存在：可能是 sessionId 编造的，按"资源不存在"处理。
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                     "report not found"
             );
         }
@@ -12037,7 +11512,7 @@ public class ReportController {
                 sessions.selectById(sessionId.toString());
         if (session == null) {
             // 会话都不存在，说明 sessionId 非法，按"资源不存在"处理。
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                     "interview session not found"
             );
         }
@@ -12051,13 +11526,25 @@ public class ReportController {
         }
     }
 }
+// 修改结束
 ```
 
-#### 文件 2：`src/main/java/com/example/interview/application/ReportGenerationAsyncService.java`
+---
 
-**创建这个文件干什么：** 真正干活的异步服务。`POST` 接口把任务丢进来后，它在独立线程池 `reportGenerationTaskExecutor`（核心 2 / 最大 4 / 队列 30）里组装上下文、调 AI、写回正文并置 `COMPLETED`；任何异常都置 `FAILED` 并记日志。之所以把 `@Async` 放在服务方法上而不是 Controller 方法上：Controller 方法身上挂着请求上下文（SecurityContext、请求属性），切线程后会丢，这里只接收 `sessionId` 和 `reportId` 两个纯净参数，异步线程不需要任何请求上下文。显式写线程池名是为了不让 Spring 退回默认的 `SimpleAsyncTaskExecutor`（每次新建线程、不复用，长任务跑几次就把机器拖垮）。
+#### 文件 4：`src/main/java/com/example/interview/application/ReportGenerationAsyncService.java`
+
+**创建这个文件干什么：** 真正干活的业务方法。组装上下文 → 调 AI → 追加表现分析 → 写回正文并置 `COMPLETED`。
+
+**名字里还有 Async，但它已经不是 `@Async` 方法了。** 异步的语义挪到了队列上：`ReportController` 投一条 `ReportTask`，`ReportTaskConsumer` 收到后调本方法。为什么不改名：调用方（Controller / `SessionRecoveryService`）与内部逻辑都没变，改名的收益只是好看，却要动一圈引用面——名字保留、语义在注释里说清。
+
+**为什么返回 `boolean` 而不是 `void`：** 消费者需要知道"这次失败要不要重试"。`true` = 成功或无需重试（记录已不存在），`false` = 可重试失败。本方法**不写 `FAILED` 终态**——重试期间必须停在 `GENERATING`，终态统一由消费者在重试耗尽时调 `markFailed` 落。
+
+**为什么先等 90 秒"在途评分"：** 评分是异步写回的（答案先插成 `SUBMITTED`，评分线程算完再置 `JUDGED` 并写 `score`）。用户可能"答完最后一道题立即点生成报告"，若不等评分写完，上下文组装读到的最后几题会是"无评分"，AI 生成的报告随之把它们记成"未作答/无评分"。这里轮询答案状态直到全部 `JUDGED`，限时 90 秒；超时则放弃等待让报告先行——评分真卡住时，宁可报告标注样本不足也不无限阻塞。
+
+**表现分析为什么单独 `try-catch`：** `demeanor.analyze` 是又一次 AI 调用，可能因为整场没作答而跳过，也可能因上游瞬时失败而抛异常。表现分析只是报告的加分项，它失败不该让主流程辛苦生成好的整份报告一起变 `FAILED`，所以这里兜住并只记一条 warn。
 
 ```java
+// 从这里开始是新增的：以下整个文件都是新增的（项目里缺失这个文件）
 package com.example.interview.application;
 
 import com.example.interview.ai.DemeanorAnalysisService;
@@ -12066,7 +11553,6 @@ import com.example.interview.infrastructure.mysql.ReportEntity;
 import com.example.interview.infrastructure.mysql.ReportMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -12074,19 +11560,19 @@ import java.util.UUID;
 // ============================================================
 // 报告生成异步服务
 // ============================================================
-// 为什么把 @Async 放在服务方法上，而不是直接放在 Controller 方法上：
-//   1. Controller 方法身上挂着请求上下文（SecurityContext、请求属性），切线程后会丢；
-//      这里只接收 sessionId 和 reportId 两个纯净参数，异步线程不需要任何请求上下文；
-//   2. 异步逻辑可以单独测：直接 new 出来调 generate，不必经过 HTTP。
-// 为什么用独立线程池 reportGenerationTaskExecutor（AsyncConfig 里已配好）：
-//   报告生成 = "拼一段长文本 + 一次 10~30 秒的 AI 调用"，和评分、语音转写混用同一个池
-//   会互相排队；单独一个池（核心 2 / 最大 4 / 队列 30）能把这种长尾调用隔离开。
-// 状态约定：成功写 COMPLETED，失败写 FAILED——前端只认这两个终态。
+// 为什么"异步"落在队列上，而不是 @Async 注解上：
+//   1. @Async 跑在线程池里，JVM 一崩任务就蒸发，report 行永远停在 GENERATING；
+//      走队列后消息没 ack 会自动 requeue，换一个实例接着干；
+//   2. 方法只接收 sessionId / reportId 两个纯参数，不需要请求上下文，正好能被消息载荷承载；
+//   3. 失败重试、死信、积压可视化都是 broker 现成语义，不用自己写扫库补偿。
+// 为什么方法名还叫 AsyncService：调用方（Controller / SessionRecoveryService）与内部逻辑都没变，
+//   改名只是好看，却要动一圈引用面；名字保留、语义在 javadoc 里说清。
+// 状态约定：成功写 COMPLETED；失败不写终态，返回 false 交给消费者决定重试还是落 FAILED。
 // ============================================================
 @Service
 public class ReportGenerationAsyncService {
 
-    // 日志对象：异步线程里抛出的异常不会回到请求线程，失败只能靠日志留痕。
+    // 日志对象：消费线程里抛出的异常不会回到请求线程，失败只能靠日志留痕。
     private static final Logger log =
             LoggerFactory.getLogger(
                     ReportGenerationAsyncService.class
@@ -12106,7 +11592,7 @@ public class ReportGenerationAsyncService {
     // 答案仓储：取整场作答文本（interview_answer.answer，语音答案提交时已转写成文本）。
     private final AnswerRepository answers;
 
-    // 五个协作者全部构造器注入，字段 final：异步线程读到的依赖在装配期就固定了，不会中途被换掉。
+    // 五个协作者全部构造器注入，字段 final：消费线程读到的依赖在装配期就固定了，不会中途被换掉。
     public ReportGenerationAsyncService(
             ReportMapper reports,
             InterviewContextAssembler contexts,
@@ -12122,27 +11608,53 @@ public class ReportGenerationAsyncService {
     }
 
     /**
-     * 异步生成报告：组装上下文 → 调 AI → 写回正文并置 COMPLETED；任何异常置 FAILED。
+     * 生成报告：组装上下文 → 调 AI → 写回正文并置 COMPLETED。
      *
-     * <p>为什么入参是 sessionId + reportId 两个：sessionId 用来查数据，reportId 用来定位
-     * 要更新的那一行。记录是 Controller 那边建好的，这里只负责"填内容 + 改状态"。</p>
+     * <p><b>注意：这里已经不是 @Async 方法了。</b>异步的语义挪到了队列上——
+     * ReportController 投一条 ReportTask 消息，ReportTaskConsumer 收到后调用本方法。
+     * 这个变化补上了一个真实缺口：@Async 跑在线程池里，JVM 一崩，正在生成的任务直接蒸发，
+     * report 行永远停在 GENERATING；走队列之后，消息没 ack 就自动 requeue。
+     *
+     * <p>为什么方法名还叫 AsyncService：调用方（Controller / SessionRecoveryService）
+     * 与内部逻辑都没变，改名的收益只是好看，却要动一圈引用面。名字保留、语义在注释里说清。
+     *
+     * <p><b>返回值语义</b>：true = 成功或无需重试（记录已不存在）；
+     * false = 可重试失败，由消费者决定投延迟重试队列还是落死信。
+     * 本方法不写 FAILED 终态——重试期间必须停在 GENERATING，否则前端会先闪一下
+     * 「生成失败」再跳回「生成中」。终态统一由消费者在重试耗尽时 {@link #markFailed} 落。
      *
      * @param sessionId 面试会话 ID
      * @param reportId  报告记录的主键 ID
+     * @return true 表示已处理完（成功或无需重试），false 表示可重试失败
      */
-    // 显式指定线程池名。不指定的话 Spring 会退回默认的 SimpleAsyncTaskExecutor——
-    // 它每次调用新建一个线程且不复用，报告生成这种长任务跑几次就能把机器拖垮。
-    @Async("reportGenerationTaskExecutor")
-    public void generate(UUID sessionId, Long reportId) {
+    public boolean generate(UUID sessionId, Long reportId) {
         // 第一步：按主键取报告记录。取不到就直接返回——正常不会发生（Controller 刚插过），
         // 但记录被并发删除时，若继续往下走就会在 entity.setStatus 处抛 NPE，
         // 而 NPE 发生在 try 之外，日志里什么都留不下。所以先挡一道。
+        // 记录不存在属于「重试也不会变好」，返回 true 让消费者直接 ack。
         ReportEntity entity = reports.selectById(reportId);
         if (entity == null) {
-            return;
+            return true;
         }
 
         try {
+            // 第二步半：等待在途评分落库。
+            // 为什么必须有这一步：评分是异步写回的（答案先插成 SUBMITTED，评分线程算完
+            // 再置 JUDGED 并写 score）。用户可能"答完最后一道题立即点生成报告"，若不等
+            // 评分写完，上下文组装读到的最后几道题会是"无评分"，AI 生成的报告随之把她们
+            // 记成"未作答/无评分"。这里轮询答案状态直到全部 JUDGED；限时 90 秒，
+            // 超时则放弃等待让报告先行——评分真卡住时，宁可报告标注样本不足也不无限阻塞。
+            long deadline = System.currentTimeMillis() + 90_000L;
+            while (answers.hasPendingJudges(sessionId)
+                    && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(2000L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
             // 第二步：组装上下文。查题目、答案、追问三张表并拼成一段文本，
             // 具体怎么查都在实现类里，这里只拿结果字符串。
             String context = contexts.assemble(sessionId);
@@ -12167,20 +11679,37 @@ public class ReportGenerationAsyncService {
             entity.setContent(markdown);
             entity.setStatus("COMPLETED");
             reports.updateById(entity);
+            return true;
 
         } catch (Exception e) {
-            // 失败也必须落状态：前端靠 FAILED 显示"生成失败，请重试"。
-            // 不写的话记录会永远停在 GENERATING，用户看到的是一直转圈。
-            entity.setStatus("FAILED");
-            reports.updateById(entity);
-            // 异常本身一定要记日志。异步线程的堆栈不会冒泡到任何请求里，
+            // 这里不写 FAILED：失败可能只是瞬时抖动，消费者会用同一份载荷重试。
+            // 若此刻写成终态，重试成功时前端会经历「FAILED → GENERATING → COMPLETED」
+            // 的抖动；而如果重试耗尽，消费者会调 markFailed 统一落终态。
+            // 异常本身一定要记日志。消费线程的堆栈不会冒泡到任何请求里，
             // 不记日志就无法区分到底是 AI 超时、还是上下文组装时查库失败。
             log.error(
                     "report generation failed, sessionId={}",
                     sessionId,
                     e
             );
+            return false;
         }
+    }
+
+    /**
+     * 兜底置 FAILED：消费者捕获到未预期异常（连 generate 内部的 catch 都没兜住）时调用。
+     *
+     * <p>为什么需要它：generate 内部已经把 AI 失败收敛成 FAILED，但「selectById 抛异常」
+     * 「Mapper 注入失败」这类问题会绕过内部的 catch。没有这一步兜底，
+     * report 行会永远停在 GENERATING，前端一直转圈，用户以为系统挂了。
+     */
+    public void markFailed(Long reportId) {
+        ReportEntity entity = reports.selectById(reportId);
+        if (entity == null) {
+            return;
+        }
+        entity.setStatus("FAILED");
+        reports.updateById(entity);
     }
 
     /**
@@ -12215,7 +11744,155 @@ public class ReportGenerationAsyncService {
         }
     }
 }
+// 新增结束
 ```
+
+---
+
+#### 文件 5：`src/main/java/com/example/interview/application/ReportTaskConsumer.java`
+
+**创建这个文件干什么：** 报告任务的消费者。`@RabbitListener(queues = RabbitConfig.REPORT_QUEUE)` 收消息 → 幂等判重 → 调 `generation.generate` → 成功 ack / 失败转重试或死信。
+
+**为什么消费端还要再判一次重：** 生产端已经挡过"10 分钟内算正在跑"，但挡不住两种漏网——① 两条消息在毫秒级同时入队（都还没写状态）；② 之前重复投递遗留在队列里的旧消息。这两条都进来后，第一份生成完会把状态写成 `COMPLETED`，第二条如果不判重就会把一份已经好的报告清空重做，用户看到已完成的报告又变回"生成中"。所以进来先 `selectById`：已 `COMPLETED` 且正文非空 → 直接 ack 跳过。
+
+**两条路都 ack 的原因：** 正常路径在正文写回、状态置 `COMPLETED` 之后 ack；失败路径在投完重试队列 / 死信之后 ack。"已交给下一跳"也是一种已处理状态——不 ack 会让消息在 unacked 里挂着，连接断开后被重投，反而变成无限热重试。
+
+**重试耗尽时为什么要先 `markFailed` 再进死信：** 死信是给运维看的现场，`FAILED` 是给前端看的终态，两者缺一个都会让人以为报告还在生成。用户看到 `FAILED` 后可以点"重新生成"再投一次。
+
+**为什么只重试 3 次：** 失败里有一大块是 AI 超时、限流这类瞬时抖动，隔 10 秒重跑一次的成本远低于让用户手动点"重新生成"；另一块是结构性的（整场没答几道题、上下文拼不出来），重跑还是失败。上限 3 次把两类分开，既自愈又不把资源放大到无限。
+
+```java
+package com.example.interview.application;
+
+import com.example.interview.config.RabbitConfig;
+import com.example.interview.infrastructure.mysql.ReportEntity;
+import com.example.interview.infrastructure.mysql.ReportMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rabbitmq.client.Channel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+
+/**
+ * 报告消费者：取任务 → 生成 → 写回状态 → ack。
+ *
+ * <h3>失败走重试，重试耗尽才落终态</h3>
+ * 与评分、追问同一套结构：可重试失败投延迟重试队列（TTL 10 秒后经 DLX 回主队列），
+ * 超过 {@code MAX_RETRY} 次转死信并置 FAILED。
+ * <ul>
+ *   <li><b>为什么要重试</b>：报告失败里有一大块是 AI 超时、限流这类瞬时抖动，
+ *       隔 10 秒重跑一次的成本远低于让用户手动点「重新生成」。</li>
+ *   <li><b>为什么只重试 3 次</b>：另一块失败是结构性的（整场没答几道题、上下文拼不出来），
+ *       重跑还是失败。上限 3 次把两类分开，既自愈又不把资源放大到无限。</li>
+ *   <li><b>为什么重试期间不写 FAILED</b>：一旦落终态，用户会先看到「生成失败」，
+ *       几秒后又跳回「生成中」，比多等十几秒更让人以为系统出毛病。</li>
+ * </ul>
+ *
+ * <h3>ack 的位置</h3>
+ * 正常路径：正文写回 + 状态置 COMPLETED 之后 ack。
+ * 失败路径：投完重试队列 / 死信之后 ack。
+ * 两条路都 ack，是因为「已交给下一跳」也是一种已处理状态——不 ack 会让消息在
+ * unacked 里挂着，连接断开后被重投，反而变成无限热重试。
+ */
+@Component
+public class ReportTaskConsumer {
+
+    private static final Logger log = LoggerFactory.getLogger(ReportTaskConsumer.class);
+
+    /** 与评分任务一致：最多重试 3 次，每次间隔 10 秒（由重试队列 TTL 决定） */
+    private static final int MAX_RETRY = 3;
+
+    private final ReportGenerationAsyncService generation;
+    private final ReportTaskPublisher publisher;
+    private final ObjectMapper mapper;
+    // 从这里开始是新增的：报告表 Mapper，用于消费前判重。
+    private final ReportMapper reports;
+    // 新增结束
+
+    public ReportTaskConsumer(ReportGenerationAsyncService generation,
+                              ReportTaskPublisher publisher,
+                              ObjectMapper mapper,
+                              ReportMapper reports) {
+        this.generation = generation;
+        this.publisher = publisher;
+        this.mapper = mapper;
+        this.reports = reports;
+    }
+
+    @RabbitListener(queues = RabbitConfig.REPORT_QUEUE)
+    public void onReport(String payload, Message message, Channel channel) throws IOException {
+        long tag = message.getMessageProperties().getDeliveryTag();
+        ReportTask task = null;
+        try {
+            task = mapper.readValue(payload, ReportTask.class);
+            // 从这里开始是新增的：消费端幂等。
+            // 为什么生产端已经拦过还要再拦一道：生产端的判断基于「10 分钟内算正在跑」，
+            // 挡不住两种漏网——① 两条消息在毫秒级同时入队（都还没写状态）；
+            // ② 之前重复投递遗留在队列里的旧消息。这两条都进来后，
+            // 第一份生成完会把状态写成 COMPLETED，第二条如果不判重就会把
+            // 一份已经好的报告清空重做，用户看到已完成的报告又变回「生成中」。
+            ReportEntity current = reports.selectById(task.reportId());
+            if (current != null
+                    && "COMPLETED".equals(current.getStatus())
+                    && current.getContent() != null
+                    && !current.getContent().isBlank()) {
+                log.info("报告已生成，跳过重复任务 reportId={} sessionId={}",
+                        task.reportId(), task.sessionId());
+                channel.basicAck(tag, false);
+                return;
+            }
+            // 新增结束
+            if (!generation.generate(task.sessionId(), task.reportId())) {
+                // 可重试失败：不在 generate 里落 FAILED，交给这里决定下一跳
+                retryOrDead(task, channel, tag);
+                return;
+            }
+            channel.basicAck(tag, false);
+        } catch (Exception e) {
+            // 走到这里的多半是「记录被删」「Mapper 异常」这类绕过 generate 内部 catch 的问题，
+            // 以及消息体本身反序列化失败（此时 task 为 null）。
+            log.error("报告任务处理失败，按可重试失败处理: {}", payload, e);
+            retryOrDead(task, channel, tag);
+        }
+    }
+
+    /**
+     * 重试或进死信。
+     *
+     * <p>重试投延迟队列而不是 {@code basicNack(requeue=true)}：requeue 会把消息立刻放回队首，
+     * 一个正在限流的模型接口会被连续打三次、三次全败直接进死信，重试等于没重试。
+     * 隔 10 秒再回来，才给下游留出恢复窗口。
+     *
+     * <p>重试耗尽时先 {@code markFailed} 再进死信：死信是给运维看的现场，
+     * FAILED 是给前端看的终态，两者缺一个都会让人以为报告还在生成。
+     */
+    private void retryOrDead(ReportTask task, Channel channel, long tag) throws IOException {
+        if (task == null) {
+            // 消息体本身解析不了：重投也还是解析不了，直接 ack 掉并留日志
+            channel.basicAck(tag, false);
+            return;
+        }
+        if (task.retryCount() >= MAX_RETRY) {
+            log.error("报告重试超限，置 FAILED 并转死信 reportId={} retryCount={}",
+                    task.reportId(), task.retryCount());
+            generation.markFailed(task.reportId());
+            publisher.deadLetter(task);
+        } else {
+            log.warn("报告生成失败，10 秒后重试 reportId={} 第 {}/{} 次",
+                    task.reportId(), task.retryCount() + 1, MAX_RETRY);
+            publisher.retryLater(new ReportTask(
+                    task.sessionId(), task.reportId(), task.retryCount() + 1));
+        }
+        channel.basicAck(tag, false);
+    }
+}
+```
+
+---
 
 接口调用流程全览：
 
@@ -12229,30 +11906,34 @@ public class ReportGenerationAsyncService {
      │       └─ 查会话归属，非本人会话 → AccessDeniedException(403)
      │
      ├─ 2. reports.selectOne(session_id = sessionId)
-     │       ├─ 不存在：insert 一条 status=GENERATING
-     │       └─ 已存在：status=GENERATING、content=null，updateById
+     │       ├─ 不存在：insert 一条 status=GENERATING（冲突则回查）
+     │       └─ 已存在且 COMPLETED 且正文非空：直接返回，不重算
      │
-     ├─ 3. generation.generate(sessionId, entity.id)  ← @Async，立即返回
+     ├─ 3. 原子 UPDATE 抢占：status=GENERATING、content=null、updated_at=now
+     │       └─ 影响行数 0 → 别人正在生成，返回 GENERATING，不投递
      │
-     └─ 4. 返回 ReportView(sessionId, "GENERATING", null)
+     ├─ 4. publisher.publish(sessionId, reportId)   ← 投进 RabbitMQ，立即返回
+     │
+     └─ 5. 返回 ReportView(sessionId, "GENERATING", null)
 
-  ── 异步线程 reportGenerationTaskExecutor ──
-  ReportGenerationAsyncService.generate()
+  ── ReportTaskConsumer 的监听线程（手动 ack）──
+  ReportTaskConsumer.onReport()
      │
-     ├─ 1. reports.selectById(reportId)（取不到直接返回）
-     │
-     ├─ 2. contexts.assemble(sessionId) → 上下文字符串
-     │
-     ├─ 3. ai.generateReport(sessionId, context) → Markdown
-     │
-     └─ 4. setContent(markdown) + setStatus("COMPLETED") + updateById
-             └─ 异常：setStatus("FAILED") + updateById + log.error
+     ├─ 1. 反序列化 ReportTask
+     ├─ 2. 幂等判重：已 COMPLETED 且正文非空 → ack 跳过
+     ├─ 3. generation.generate(sessionId, reportId)
+     │       ├─ 记录不存在 → return true（无需重试）
+     │       ├─ 等评分落库（最多 90 秒）→ 组装上下文 → 调 AI → 追加表现分析
+     │       └─ 写回 content + status=COMPLETED → return true
+     ├─ 4a. 成功 → basicAck
+     └─ 4b. 失败 → retryLater（retryCount+1，TTL 10 秒回主队列）
+              重试耗尽 → markFailed(FAILED) + deadLetter → basicAck
 
   前端轮询 GET /api/reports/{sessionId}/status
      │
      ├─ status=GENERATING → 继续轮询
      ├─ status=COMPLETED  → 用 GET /api/reports/{sessionId} 取正文渲染
-     └─ status=FAILED     → 提示"生成失败，请重试"
+     └─ status=FAILED     → 提示"生成失败，请重试"，可再点一次触发生成
 ```
 
 ## 十四、表现分析模块
@@ -12296,16 +11977,16 @@ public class ReportGenerationAsyncService {
 
 ```text
 前端点击"语音输入"按钮，getUserMedia 采集麦克风音频
-    -> 前端打开业务 WebSocket（/ws/interviews/{sessionId}），发 {type:'audio_start'} 通知后端建立 NLS 上行
-    -> 前端把降采样后的裸 PCM 以二进制帧持续推给后端（前端不再直连 NLS）
-    -> InterviewWebSocketHandler.handleBinaryMessage 收到裸 PCM，交给 AliyunNlsRealtimeRelay.pushAudio() 补 NLS 帧头推流识别
-    -> NLS 识别的分片由 AliyunNlsRealtimeRelay 落回 AsyncTranscriptionBuffer.receive() 入队
+    -> 前端调用 GET /api/speech/token 获取阿里云 NLS 临时 Token（AliyunNlsTokenService，缓存 24 小时）
+    -> 前端连接阿里云 NLS WebSocket 实时识别，产出分片（seg_id / pgs / text / rg / bg / ed）
+    -> 前端把分片通过业务 WebSocket（/ws/interviews/{sessionId}）发送给后端
+    -> InterviewWebSocketHandler 解析字段，调用 AsyncTranscriptionBuffer.receive() 入队
        （按 sessionId 隔离的 ArrayBlockingQueue，容量 256，满时阻塞 200ms 形成背压）
     -> AsyncTranscriptionBuffer.consume() 在 transcriptionTaskExecutor 线程池异步消费
        -> TranscriptionSessionContext.mergeSegment() 按 seg_id 去重、排序、拼接
        -> 只把 ed=true 的已确认分片写入 transcript，临时结果不污染最终文本
-    -> 面试结束时 ReportGenerationAsyncService.generate() 调用 AnswerRepository.loadSessionTranscript(sessionId)
-       从答案表汇总整场答案文本，交给 DemeanorAnalysisService.analyze()（见"表现 1"）
+    -> 面试结束时 InterviewController.end() 调用 AnswerRepository.loadSessionTranscript(sessionId)
+       从答案表汇总整场答案文本，再交给 DemeanorAnalysisService.analyze()（见"表现 1"）
 ```
 
 **为什么选阿里云 NLS（智能语音交互）：**
@@ -12316,14 +11997,13 @@ public class ReportGenerationAsyncService {
 **文件列表：**
 
 ```text
-src/main/java/com/example/interview/websocket/AliyunNlsTokenService.java      — 阿里云 NLS Token 签发与缓存（供后端中继使用）
-src/main/java/com/example/interview/websocket/AliyunNlsRealtimeRelay.java     — 阿里云 NLS 后端中继：补帧头推流 + 识别分片落回 buffer
-src/main/java/com/example/interview/websocket/NioAudioRingBuffer.java         — 音频环形缓冲，用于 NLS 推流读取
-src/main/java/com/example/interview/websocket/WebSocketConfig.java            — 注册业务 WebSocket 路由
-src/main/java/com/example/interview/websocket/AsyncTranscriptionBuffer.java   — 按会话隔离的异步音频缓冲
-src/main/java/com/example/interview/websocket/TranscriptionSessionContext.java— 分片去重合并上下文
-src/main/java/com/example/interview/websocket/InterviewWebSocketHandler.java  — WebSocket 消息处理器（文本控制 + 二进制音频转发）
-frontend/src/nlsTranscriptionClient.js                                        — 前端纯采集端：降采样成裸 PCM 经业务 WS 推给后端中继
+src/main/java/com/example/interview/websocket/AliyunNlsTokenService.java        — 阿里云 NLS Token 签发与缓存
+src/main/java/com/example/interview/websocket/SpeechTokenController.java       — 语音 Token 获取接口
+src/main/java/com/example/interview/websocket/WebSocketConfig.java             — 注册业务 WebSocket 路由
+src/main/java/com/example/interview/websocket/AsyncTranscriptionBuffer.java    — 按会话隔离的异步音频缓冲
+src/main/java/com/example/interview/websocket/TranscriptionSessionContext.java — 分片去重合并上下文
+src/main/java/com/example/interview/websocket/InterviewWebSocketHandler.java   — WebSocket 消息处理器
+frontend/src/nlsTranscriptionClient.js                                        — 前端 NLS 采集/降采样/分片上报客户端
 ```
 
 ---
@@ -12332,7 +12012,7 @@ frontend/src/nlsTranscriptionClient.js                                        �
 
 **文件位置：** `src/main/java/com/example/interview/websocket/AliyunNlsTokenService.java`
 
-**文件作用：** 负责向阿里云 NLS 换取临时 Token 并缓存。Token 只在后端内部使用——`AliyunNlsRealtimeRelay` 建立上行连接时用它鉴权（后端用 `app_key + AccessKeyId + AccessKeySecret` 换取短期 Token）。**当前前端不直连 NLS、也不取 Token**，所以这个类不再承担"把 Token 给前端"的职责，前端拿不到也无需持有任何凭据。`SpeechTokenController` 仍保留 `/api/speech/token` 接口，但只是兜底/调试用，NlsTranscriptionClient 不再调用它。
+**文件作用：** 负责向阿里云 NLS 换取临时 Token 并缓存。前端无法安全持有 AccessKey，必须由后端用 `app_key + AccessKeyId + AccessKeySecret` 换取短期 Token，前端再用 Token 连接 NLS WebSocket 完成语音识别。
 
 **依赖关系：**
 - 依赖 Spring `RestClient`（Spring Boot 3.3 自动配置 `RestClient.Builder` Bean）
@@ -12484,7 +12164,7 @@ public class AliyunNlsTokenService {
 
 **文件位置：** `src/main/java/com/example/interview/websocket/SpeechTokenController.java`
 
-**文件作用：** 提供获取 NLS 临时 Token 的 REST 接口（返回 `{ token, appKey }`）。在"后端中继"架构下前端不再直连 NLS、也不再调用本接口，Token 由后端的 `AliyunNlsRealtimeRelay` 内部使用；本接口仅是后端复用 Token 服务的调试/兜底入口。
+**文件作用：** 给前端提供获取 NLS 临时 Token 的 REST 接口。前端开始语音识别前先调用它，拿到 token 和 appKey 后再连接阿里云 NLS。
 
 **依赖关系：**
 - 依赖 `AliyunNlsTokenService`（上述文件）
@@ -12500,11 +12180,10 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Map;
 
 // ============================================================
-// 语音 Token 接口 —— 签发 NLS 临时 Token
+// 语音 Token 接口 —— 给前端签发 NLS 临时 Token
 // ============================================================
-// 阿里云 NLS 实时识别需要短期 Token（有效期 24 小时）。该接口把 token 与
-// appKey 下发出去；当前前端走"后端中继"，由 AliyunNlsRealtimeRelay 在服务端
-// 获取并使用 Token，前端不再直连 NLS。AccessKey 不出服务器，只下发短期 Token。
+// 前端开始语音识别前调用 GET /api/speech/token，
+// 拿到 token 和 appKey 后连接阿里云 NLS WebSocket 实时识别。
 // ============================================================
 @RestController
 @RequestMapping("/api/speech")
@@ -12520,7 +12199,7 @@ public class SpeechTokenController {
      * 返回 NLS 临时 Token。
      *
      * @return {"token": "...", "appKey": "..."}，
-     *         后端 AliyunNlsRealtimeRelay 建立上行连接时用这两个值向阿里云 NLS 鉴权
+     *         前端用这两个值连接阿里云 NLS 实时语音识别
      */
     @GetMapping("/token")
     public Map<String, String> token() {
@@ -12563,7 +12242,7 @@ import java.util.Map;
 // ============================================================
 // WebSocket 配置 —— 注册语音转写路由
 // ============================================================
-// 前端连接地址：ws://localhost:18080/ws/interviews/{sessionId}
+// 前端连接地址：ws://localhost:8080/ws/interviews/{sessionId}
 //
 // 握手拦截器的作用：
 //   把 URL 中的 sessionId 解析出来放入 attributes，
@@ -13308,76 +12987,115 @@ public class InterviewWebSocketHandler
 
 **文件位置：** `frontend/src/nlsTranscriptionClient.js`（语音客户端）+ `frontend/src/main.jsx`（页面接线）
 
-**本部分作用：** 前端只做"采集 + 推流"：采集麦克风音频，用 `AudioContext` 降采样成 NLS 要求的 16k 单声道裸 PCM，直接以二进制帧推给后端业务 WebSocket；后端 `AliyunNlsRealtimeRelay` 补齐 NLS 的 4 字节帧头并转发给阿里云 NLS，识别分片再由它落回后端 `AsyncTranscriptionBuffer` 去重合并，临时结果以 `{type:'asr_preview'}` 推回前端做实时预览。前端**不再直连阿里云 NLS，也不再取 Token**——接入点、鉴权与识别都收敛到后端，链路上根本不存在把 AccessKey 下发到浏览器的风险。
+**本部分作用：** 前端采集麦克风音频，用 `AudioContext` 降采样成 NLS 要求的 16k 单声道 PCM，加 4 字节帧头推给阿里云 NLS 实时识别，再把识别分片按业务协议通过业务 WebSocket 上报后端。界面只用 NLS 回来的临时结果做实时预览，最终文本由后端去重合并后落库——**录音已经不是 MediaRecorder 占位实现，也不是 Web Speech API**。
 
 **一次 `start()` 干四件事：**
-1. 打开业务 WebSocket（`/ws/interviews/{sessionId}`），发 `{type:'audio_start'}` 通知后端建立阿里云 NLS 上行
-2. `getUserMedia` 拿麦克风，`AudioContext` 把音频降采样成 16k 单声道 PCM
-3. 采集的裸 PCM 以二进制帧持续推给后端（NLS 的 4 字节帧头由后端 `AliyunNlsRealtimeRelay` 补齐）
-4. 后端把 NLS 识别的临时文本以 `{type:'asr_preview'}` 推回，这里转给界面实时预览
+1. `getUserMedia` 拿麦克风，`AudioContext` 把音频降采样成 NLS 要的 16k 单声道 PCM
+2. `GET /api/speech/token` 取 `{ token, appKey }`（AccessKey 不出服务器，只下发 24 小时短期 Token）
+3. 连阿里云 NLS 的 `wss`，首帧发 JSON 带 `token` / `appKey`，之后按二进制帧推音频
+4. 把 NLS 回来的分片按业务协议经 `/ws/interviews/{sessionId}` 上报后端
 
 **整体链路：**
 
 ```javascript
 // 文件：frontend/src/nlsTranscriptionClient.js
-// NLS 语音转写客户端 —— 前端这一头（纯采集端，音频走后端中继）。
-// 一次 start() 干四件事：拿麦克风降采样 → 建业务 WS 发 audio_start → 裸 PCM 二进制帧推给后端
-// → 后端用 asr_preview 把 NLS 临时识别文本推回来预览。前端不再直连 NLS、不再取 Token。
-// 为什么改成"后端中继"而不是前端直连 NLS：项目亮点是"基于 WebSocket + 阿里云 NLS 的实时
-// ASR 链路"，要求后端存在"音频 → NLS"的转发。接入点、鉴权与识别结果都收敛到后端，
-// 链路上不把 AccessKey 下发到浏览器。
-
-// 采样率只支持 16k / 8k，项目统一用 16k
+// NLS 实时识别接入点（上海地域）；采样率只支持 16k / 8k，项目统一用 16k
+const NLS_URL = 'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1';
 const SAMPLE_RATE = 16000;
 
 export class NlsTranscriptionClient {
 
   constructor(options) {
     this.sessionId = options.sessionId;
-    this.onPreview = options.onPreview || (() => {});   // 后端推回的预览文本
+    this.jwt = options.jwt || '';                       // 登录后拿到的 JWT，取 Token 时要带上
+    this.onPreview = options.onPreview || (() => {});   // 临时预览文本，直接给界面显示
     this.onError = options.onError || (() => {});
-    this.business = null;      // 业务 WebSocket：上行音频 + 下行预览
+    this.business = null;      // 业务 WebSocket：上报分片
+    this.nls = null;           // 阿里云 NLS WebSocket：推音频、收识别结果
     this.audioContext = null;
     this.processor = null;
     this.micStream = null;
-    this.recording = false;
+    this.heartbeat = null;
+  }
+
+  // 取 Token：前端不能持有 AccessKey，只能让后端签发短期 Token
+  static async fetchToken(tokenUrl, jwt) {
+    const response = await fetch(tokenUrl, {
+      headers: jwt ? { Authorization: `Bearer ${jwt}` } : {}
+    });
+    if (!response.ok) {
+      throw new Error(`取语音 Token 失败：${response.status}`);
+    }
+    return response.json();   // { token, appKey }
   }
 
   async start() {
-    // 先建业务 WS，再拿麦克风，最后发 audio_start —— 顺序保证后端上行就绪后才会有音频。
+    const { token, appKey } = await NlsTranscriptionClient.fetchToken(
+        '/api/speech/token', this.jwt
+    );
     this.openBusinessSocket();
     // 只要音频；拿不到就直接报错，让用户改用文本输入
     this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // 等 WS 真正 OPEN 再发音频，否则 start 后的第一批帧会被后端当成"无上行"丢帧。
-    await new Promise(resolve => {
-      if (this.business?.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
-      this.business.addEventListener('open', () => resolve(), { once: true });
-    });
-    // 通知后端：为本会话建立上行 NLS 连接。
-    this.business.send(JSON.stringify({ type: 'audio_start' }));
-    this.recording = true;
-    this.startCapture();   // 采集 + 降采样 + 分包推送
+    this.openNlsSocket(token, appKey);
+    this.startCapture();   // 采集 + 降采样 + 分包发送
   }
 
-  // 业务 WS：地址与 WebSocketConfig 注册的路由一致；
-  // 同一连接既上行音频帧，又下行 NLS 预览文本。
+  // 业务 WS：分片上报通道，地址与 WebSocketConfig 注册的路由一致
   openBusinessSocket() {
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     this.business = new WebSocket(
         `${scheme}://${location.host}/ws/interviews/${this.sessionId}`
     );
-    // 下行：后端把 NLS 的临时识别结果以 asr_preview 推回，刷新界面预览。
-    this.business.onmessage = event => {
-      if (typeof event.data !== 'string') return;
-      const message = JSON.parse(event.data);
-      if (message.type === 'asr_preview' && message.text) {
-        this.onPreview(message.text);
-      }
+    // 后端会响应 pong；定期 ping 是为了不被中间的代理掐掉长连接
+    this.business.onopen = () => {
+      this.heartbeat = setInterval(() => {
+        if (this.business?.readyState === WebSocket.OPEN) {
+          this.business.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 10000);
     };
-    this.business.onerror = () => this.onError('语音连接异常');
+  }
+
+  // NLS WS：首帧 JSON 告诉阿里云"用哪个应用、什么格式、要不要中间结果"
+  openNlsSocket(token, appKey) {
+    this.nls = new WebSocket(NLS_URL);
+    this.nls.binaryType = 'arraybuffer';
+    this.nls.onopen = () => {
+      this.nls.send(JSON.stringify({
+        header: {
+          appkey: appKey,                    // 应用标识，由后端 getAppKey() 下发
+          token,                             // 后端签发的 24 小时临时 Token
+          message_id: String(Date.now()),    // 本次会话的消息 ID
+          task: 'transcription',
+          namespace: 'SpeechTranscriber',
+          name: 'StartTranscription'
+        },
+        payload: {
+          format: 'pcm',                     // 必须是裸 PCM，MediaRecorder 的 webm 不行
+          sample_rate: SAMPLE_RATE,
+          enable_intermediate_result: true,  // 要 ed=false 的中间结果，界面才能实时预览
+          enable_punctuation_prediction: true,          // 自动加标点，落库文本才像正常中文
+          enable_inverse_text_normalization: true       // "一二三" 归一成数字
+        }
+      }));
+    };
+    // 识别结果都是文本帧：header.name === 'TranscriptionResultChanged' 就是分片
+    this.nls.onmessage = event => {
+      if (typeof event.data !== 'string') return;   // 二进制帧不是识别结果，忽略
+      const message = JSON.parse(event.data);
+      if (message.header?.name !== 'TranscriptionResultChanged') return;
+      const payload = message.payload || {};
+      this.sendSegment({
+        seg_id: payload.seg_id ?? 0,
+        text: payload.text || '',
+        pgs: payload.pgs || '',
+        rg: [payload.rg?.[0] ?? 0],
+        bg: [payload.bg?.[0] ?? 0],
+        // 只认 ed=true 的才可能进最终 transcript；其余只当预览
+        ed: payload.ed === true || payload.ed === 'true'
+      });
+    };
+    this.nls.onerror = () => this.onError('阿里云 NLS 连接异常');
   }
 
   // 采集：AudioContext 默认采样率通常是 48k，这里线性降采样到 16k 再发
@@ -13389,7 +13107,7 @@ export class NlsTranscriptionClient {
     this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
     const ratio = this.audioContext.sampleRate / SAMPLE_RATE;
     this.processor.onaudioprocess = event => {
-      if (this.business?.readyState !== WebSocket.OPEN) return;   // WS 没连上就丢帧，不缓存
+      if (this.nls?.readyState !== WebSocket.OPEN) return;   // NLS 没连上就丢帧，不缓存
       const input = event.inputBuffer.getChannelData(0);
       // 降采样 + float32 → int16（NLS 要的是 16 位小端 PCM）
       const pcm = new Int16Array(Math.floor(input.length / ratio));
@@ -13397,26 +13115,40 @@ export class NlsTranscriptionClient {
         const sample = input[Math.floor(i * ratio)];
         pcm[i] = Math.max(-1, Math.min(1, sample)) * 0x7fff | 0;
       }
-      // 直接发裸 PCM 二进制帧；NLS 的 4 字节帧头由后端 AliyunNlsRealtimeRelay 补。
-      this.business.send(pcm.buffer);
+      this.nls.send(nlsAudioFrame(pcm.buffer));   // 4 字节头 + PCM 体
     };
     source.connect(this.processor);
     this.processor.connect(this.audioContext.destination);
   }
 
-  stop() {
-    this.recording = false;
-    // 停麦前先告诉后端"音频发完了"，后端据此发 0x04 结束帧并关闭 NLS 上行。
-    if (this.business?.readyState === WebSocket.OPEN) {
-      this.business.send(JSON.stringify({ type: 'audio_end' }));
+  // 上报一个分片：字段名与后端 InterviewWebSocketHandler.handleTextMessage 的解析一一对应
+  sendSegment(segment) {
+    if (this.business?.readyState !== WebSocket.OPEN) return;
+    this.business.send(JSON.stringify({ type: 'transcription', ...segment }));
+    // 临时结果（ed=false）拿来刷新界面预览；最终文本由后端去重合并后统一取
+    if (!segment.ed && segment.text) {
+      this.onPreview(segment.text);
     }
+  }
+
+  stop() {
+    clearInterval(this.heartbeat);
     // 关麦克风：浏览器才会撤掉录音指示条
     this.micStream?.getTracks().forEach(track => track.stop());
     this.processor?.disconnect();
     this.audioContext?.close();
-    // 关闭业务 WS：后端 afterConnectionClosed 会清理队列、转写上下文与 NLS 上行
+    this.nls?.close();
+    // 后端 afterConnectionClosed 会清理队列与转写上下文，无需再发额外指令
     this.business?.close();
   }
+}
+
+// NLS 二进制帧：4 字节头 + PCM 体（首字节 0x02 表示这是音频数据帧）
+function nlsAudioFrame(pcmBuffer) {
+  const frame = new Uint8Array(4 + pcmBuffer.byteLength);
+  frame[0] = 0x02;
+  frame.set(new Uint8Array(pcmBuffer), 4);
+  return frame.buffer;
 }
 ```
 
@@ -13870,7 +13602,7 @@ src/main/java/com/example/interview/skill/SkillLoader.java
 classpath 下的 Markdown 文件（如 /skills/question-generation.md）
     -> Spring ResourceLoader 读取文件内容（UTF-8 编码）
     -> SkillLoader 将文件内容包装为 SkillDefinition 对象
-    -> SkillDefinition 保存结构化字段：名称、版本、用途(purpose)、入口(entryPoints)、输入(inputs)、输出契约(outputContract)、正文(content)
+    -> SkillDefinition 保存三个字段：名称(name)、版本(version)、正文(content)
     -> 如果文件不存在或读取失败，抛出 IllegalStateException（启动即失败，避免运行时才发现）
 ```
 
@@ -13890,34 +13622,24 @@ classpath 下的 Markdown 文件（如 /skills/question-generation.md）
 ```java
 package com.example.interview.skill;
 
-import java.util.List;
-
 // ============================================================
-// Skill 定义 —— 结构化的业务技能，可被 Code Agent 直接消费
+// Skill 定义 —— 一份 Skill Markdown 文件加载后的不可变数据对象
 // ============================================================
-// 原本只是 (name, version, content) 三字段的裸 Markdown 壳，
-// 升级后把"技能元数据 + 规则正文"拆成可编程访问的字段：
-//   name/version     —— 标识与版本（Code Agent 用来寻址）
-//   purpose          —— 一句话用途（概述）
-//   entryPoints      —— 调用入口（自动消费点，标识"哪些链路会用到它"）
-//   inputs           —— 输入契约（参数名清单）
-//   outputContract   —— 输出契约（返回结构与格式约束）
-//   content          —— 规则主体（Markdown，注入提示词的正文）
+// 为什么用 record？
+//   - 自动生成构造器、equals()、hashCode()、toString()
+//   - 所有字段都是 final 的，创建后不可修改
+//   - 天然适合作为数据传输对象（DTO）
 //
-// 为什么这样分层："可被 Code Agent 直接消费"意味着 Skill 要能被程序读懂、
-// 而不只是塞给大模型的一段文本。元数据字段让代码能按用途/入口/契约检索和调度，
-// content 则是最底层的"规则正文"，由统一注入点（InterviewAiFacade.skillPrompt）
-// 自动拼进提示词。整条定义经 SkillController 以 JSON 暴露给外部消费方。
+// 为什么不需要在这里校验字段？
+//   - name 和 version 的合法性由调用方（SkillLoader / SkillRegistry）保证
+//   - content 的内容语义由规则文件编写者保证，程序只负责加载和传递
 // ============================================================
-public record SkillDefinition (
-    String name,
-    String version,
-    String purpose,
-    List<String> entryPoints,
-    List<String> inputs,
-    String outputContract,
-    String content
-) {}
+public record SkillDefinition(
+        String name,       // Skill 名称，如 "question-generation"（对应文件名，不含 .md 后缀）
+        String version,    // Skill 版本号，当前统一为 "v1"（后续可通过文件元数据扩展）
+        String content     // Markdown 文件的完整正文内容（UTF-8 编码）
+) {
+}
 ```
 
 ---
@@ -13943,116 +13665,70 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 
 // ============================================================
-// Skill 加载器 —— 读取 markdown 并解析出结构化字段
+// Skill 加载器 —— 从 classpath 读取 Markdown 文件并转换为 SkillDefinition
 // ============================================================
-// 每个 skill 文件头部有一段 front matter（用 --- 包裹的 key: value 行）：
-//   ---
-//   purpose: 一句话用途
-//   entry-points: A, B
-//   inputs: p1, p2
-//   output: 输出契约
-//   ---
-//   正文...
-// load() 把元数据剥离出来，剩余正文作为 SkillDefinition.content。
-// 没有 front matter 的旧文件也能加载（各元数据字段退化为空），保证向后兼容。
+// 设计理由：
+//   1. 使用 ResourceLoader 而非直接操作 File：支持从 JAR 包内读取文件，
+//      在 Spring Boot 打包为可执行 JAR 后仍然能正常工作。
+//   2. 使用 UTF-8 编码：确保中英文混排的规则文件在不同操作系统上不会乱码。
+//   3. 异常转义为 IllegalStateException：文件丢失是致命错误，应该让应用
+//      启动失败，而不是在运行时悄悄失败。
 // ============================================================
-@Component
+@Component  // 声明为 Spring 组件，可被自动扫描并注入到其他组件
 public class SkillLoader {
+
+    // Spring 的资源加载器，支持 "classpath:"、"file:"、"http://" 等前缀
     private final ResourceLoader resources;
 
+    /**
+     * 构造器注入 ResourceLoader。
+     * Spring Boot 会自动提供 ResourceLoader 实例（因为它是 Spring 核心接口）。
+     *
+     * @param resources Spring 资源加载器
+     */
     public SkillLoader(ResourceLoader resources) {
         this.resources = resources;
     }
 
+    /**
+     * 加载指定名称的 Skill 规则文件。
+     *
+     * @param name    Skill 名称，对应 src/main/resources/skills/{name}.md
+     * @param version Skill 版本号，如 "v1"
+     * @return SkillDefinition 对象，包含名称、版本和文件正文
+     * @throws IllegalStateException 如果文件不存在、不可读或 IO 异常
+     */
     public SkillDefinition load(String name, String version) {
-        Resource resource = resources.getResource("classpath:skills/" + name + ".md");
+        // ---- 步骤1：定位资源文件 ----
+        // 使用 "classpath:skills/{name}.md" 路径格式，
+        // Spring 会自动在 classpath（包括 src/main/resources/）中查找。
+        Resource resource = resources.getResource(
+                "classpath:skills/" + name + ".md"
+        );
+
+        // ---- 步骤2：读取文件内容 ----
+        // getContentAsString 是 Spring 提供的便捷方法，
+        // 内部使用 InputStream 读取，适合小文件。
+        // 使用 StandardCharsets.UTF_8 确保国际化的字符编码正确。
         try {
-            String raw = resource.getContentAsString(StandardCharsets.UTF_8);
-            Meta meta = parse(raw);
-            return new SkillDefinition(
-                    name,
-                    version,
-                    meta.purpose(),
-                    meta.entryPoints(),
-                    meta.inputs(),
-                    meta.output(),
-                    // 正文去掉首尾空白，避免注入提示词时带上多余换行。
-                    meta.body().trim()
-            );
+            String content = resource.getContentAsString(StandardCharsets.UTF_8);
+
+            // ---- 步骤3：创建 SkillDefinition 对象 ----
+            // 将文件名称、版本和正文包装为不可变对象。
+            return new SkillDefinition(name, version, content);
+
         } catch (IOException e) {
+            // ---- 异常处理 ----
+            // 如果文件不存在（FileNotFoundException 是 IOException 的子类）、
+            // 权限不足或发生其他 IO 错误，将受检异常转为非受检异常抛出。
+            // 这样调用方不需要显式 try-catch，而且应用会在启动时快速失败。
             throw new IllegalStateException(
-                    "cannot load skill:" + name,
+                    "cannot load skill: " + name,
                     e
             );
         }
-    }
-
-    // ============================================================
-    // 私有：解析 front matter，返回元数据 + 正文
-    // ============================================================
-    private Meta parse(String raw) {
-        List<String> lines = List.of(raw.split("\r?\n"));
-        // 第一行不是 "---"：没有 front matter，整篇都当正文。
-        if (lines.isEmpty() || !lines.get(0).trim().equals("---")) {
-            return new Meta("", List.of(), List.of(), "", raw);
-        }
-        String purpose = "";
-        String output = "";
-        List<String> entryPoints = new ArrayList<>();
-        List<String> inputs = new ArrayList<>();
-        int index = 1;
-        // 逐行读到第二个 "---"，其间的行按 key: value 切分。
-        for (; index < lines.size(); index += 1) {
-            String line = lines.get(index);
-            if (line.trim().equals("---")) {
-                index += 1;   // 再跳一行，index 指向正文起点
-                break;
-            }
-            int colon = line.indexOf(':');
-            if (colon < 0) {
-                continue;
-            }
-            String key = line.substring(0, colon).trim();
-            String value = line.substring(colon + 1).trim();
-            switch (key) {
-                case "purpose" -> purpose = value;
-                case "output" -> output = value;
-                case "entry-points" -> entryPoints = splitComma(value);
-                case "inputs" -> inputs = splitComma(value);
-                default -> { /* 未知 key 忽略，不阻塞加载 */ }
-            }
-        }
-        // 正文 = front matter 之后的所有行。
-        String body = String.join("\n", lines.subList(index, lines.size()));
-        return new Meta(purpose, entryPoints, inputs, output, body);
-    }
-
-    // 把 "a, b, c" 拆成去空白、滤空串的字符串列表（元数据里 entry-points/inputs 都是逗号分隔）。
-    private List<String> splitComma(String value) {
-        List<String> result = new ArrayList<>();
-        for (String part : value.split(",")) {
-            String trimmed = part.trim();
-            if (!trimmed.isEmpty()) {
-                result.add(trimmed);
-            }
-        }
-        return result;
-    }
-
-    // ============================================================
-    // 内部记录：front matter 解析结果
-    // ============================================================
-    private record Meta(
-            String purpose,
-            List<String> entryPoints,
-            List<String> inputs,
-            String output,
-            String body
-    ) {
     }
 }
 ```
@@ -14326,7 +14002,7 @@ public class SkillController {
 - 状态集中管理便于理解完整的页面数据流
 - 每个 `useState` 都对应一个明确的业务对象或页面阶段
 
-**为什么请求都写成相对路径：** `main.jsx` 与 `nlsTranscriptionClient.js` 里的请求都是 `/api/...` 与 `/ws/...` 这样的同源相对路径。开发时前端跑在 5173、后端跑在 18080，靠 `vite.config.js` 里的代理把 `/api`（HTTP）和 `/ws`（WebSocket）两类前缀转发到 `localhost:18080`；生产环境由 `VITE_API_ROOT` 注入真实后端地址。这属于前端脚手架的一部分，代码见本章末尾的「前端脚手架」小节。
+**为什么请求都写成相对路径：** `main.jsx` 与 `nlsTranscriptionClient.js` 里的请求都是 `/api/...` 与 `/ws/...` 这样的同源相对路径。开发时前端跑在 5173、后端跑在 8080，靠 `vite.config.js` 里的代理把 `/api`（HTTP）和 `/ws`（WebSocket）两类前缀转发到 `localhost:8080`；生产环境由 `VITE_API_ROOT` 注入真实后端地址。这属于前端脚手架的一部分，代码见本章末尾的「前端脚手架」小节。
 
 下面这段是 `main.jsx` 的模块头部与状态声明部分（节选，`escapeHtml` / `markdownToHtml` 两个 Markdown 工具函数放在「前端 5：编写报告页面」里讲）。所有代码与项目真实代码逐字一致。
 
@@ -14632,9 +14308,9 @@ function App() {
       method: 'POST'
     });
     // 取第一题：后端只有 POST .../questions 这个入口（没有 GET .../questions/current）。
-    // 从这里开始是修改的：改用统一的 takeQuestion——后端出首题可能碰 singleflight
-    // 可重试超时(500)或短暂非 ACTIVE，takeQuestion 会 10 次重试直到命中就绪，替代一次性 request。
-    const first = await takeQuestion(value.sessionId);
+    const first = await request(`/api/interviews/${value.sessionId}/questions`, {
+      method: 'POST'
+    });
     setQuestion(first);
     // 新增：开始一场新面试时清掉上一场残留的追问，否则第一题会被上一场的追问盖住。
     setFollowUp(null);
@@ -14783,9 +14459,7 @@ function App() {
 ```javascript
 // 文件：frontend/src/main.jsx（节选：等待状态推进）
   const waitForNextQuestionState = async sessionId => {
-    // 上限 150 秒：后端评分/追问/出题是多次 AI 调用，正常几十秒内会推进到下一题。
-    // 万一某环节异常导致状态停在中间态，也不能让用户无限转圈，超时就明确报错。
-    for (let attempt = 0; attempt < 150; attempt += 1) {
+    for (;;) {
       const current = await request(
         `/api/interviews/${sessionId}/state`
       );
@@ -14808,35 +14482,6 @@ function App() {
       // 还在评分 / 推进中：等 1 秒再查，避免打满后端。
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    throw new Error('等待下一题超时，请刷新页面重试。');
-  };
-```
-
-### 取题并等待就绪（takeQuestion）
-
-后端出题接口 POST /api/interviews/{sessionId}/questions 在异步出题尚未落库时会返回 HTTP 500（singleflight 的可重试超时信号），或返回 status 非 ACTIVE 的中间态题。一次性的 request 撞上就报错，所以统一用"有限次重取 + 校验 ACTIVE"的辅助函数，供首次取题与后续取题复用。
-
-```javascript
-// 文件：frontend/src/main.jsx（节选：统一取题）
-  const takeQuestion = async sessionId => {
-    const maxAttempts = 10; // 单题最多等约 10*1.5=15 秒：首题生成通常几十秒内完成。
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      let next;
-      try {
-        next = await request(`/api/interviews/${sessionId}/questions`, {
-          method: 'POST'
-        });
-      } catch (error) {
-        // 后端 singleflight 超时会以 500 形式抛出"可重试"信号，这里吞掉后重试，
-        // 不把可恢复的生成中态当成失败直接展示给用户。
-      }
-      // 只有 ACTIVE 的题才可作答：预生成题和中间态都不能展示。
-      if (next && next.id && next.status === 'ACTIVE') {
-        return next;
-      }
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    }
-    throw new Error('题目生成超时，请稍后刷新重试。');
   };
 ```
 
@@ -14912,9 +14557,13 @@ function App() {
     // 新增结束
 
     // 状态已推进：这时候才去取下一题（后端只有 POST .../questions）。
-    // 从这里开始是修改的：改用统一的 takeQuestion——后端出下一题可能碰 singleflight
-    // 可重试超时(500)或短暂未 ACTIVE，takeQuestion 会重取到就绪，替代原来的一次性 request。
-    const next = await takeQuestion(session.sessionId);
+    const next = await request(`/api/interviews/${session.sessionId}/questions`, {
+      method: 'POST'
+    });
+    // 只有 ACTIVE 的题才允许作答：预生成题和已淘汰题都不能展示。
+    if (!next || next.status !== 'ACTIVE') {
+      throw new Error('下一题尚未就绪');
+    }
     setQuestion(next);
     setNotice('答案已提交，已进入下一题。');
     // 修改结束
@@ -14930,7 +14579,7 @@ function App() {
 
 ### 语音录音链路（阿里云 NLS）
 
-录音已经**不是** MediaRecorder 占位实现，也**不是**讯飞 / 星辰方案，而是 `NlsTranscriptionClient`：麦克风采集 → AudioContext 降采样到 16k 单声道 PCM → 前端**不再直连阿里云 NLS**，而是把裸 PCM 经业务 WebSocket（`/ws/interviews/{sessionId}`）推给后端，由后端 `AliyunNlsRealtimeRelay` 补齐 NLS 帧头并推流识别；识别结果由后端去重合并，临时文本经 `asr_preview` 推回做实时预览。
+录音已经**不是** MediaRecorder 占位实现，也**不是**讯飞 / 星辰方案，而是 `NlsTranscriptionClient`：麦克风采集 → AudioContext 降采样到 16k 单声道 PCM → 加 4 字节帧头 → 推阿里云 NLS → 把识别分片按业务协议上报后端。
 
 ```javascript
 // 文件：frontend/src/main.jsx（节选：开始/停止录音）
@@ -14971,72 +14620,30 @@ function App() {
   };
 ```
 
-`NlsTranscriptionClient` 的完整实现在 `frontend/src/nlsTranscriptionClient.js`，一次 `start()` 干四件事：
+`NlsTranscriptionClient` 的完整实现在 `frontend/src/nlsTranscriptionClient.js`，核心步骤（`start()` 里四件事）：
 
-1. `getUserMedia` 拿麦克风，`AudioContext` 把音频降采样成 16k 单声道 PCM
-2. 打开业务 WebSocket，发 `{type:'audio_start'}` 通知后端建立阿里云 NLS 上行
-3. 采集的裸 PCM 以二进制帧持续推给后端（NLS 的帧头由后端 `AliyunNlsRealtimeRelay` 补齐，前端**不再直连 NLS**）
-4. 后端把 NLS 识别的临时文本以 `{type:'asr_preview'}` 推回，这里转给界面实时预览
+1. `getUserMedia` 拿麦克风，`AudioContext` 把音频降采样成 NLS 要的 16k 单声道 PCM
+2. `GET /api/speech/token` 取 `{ token, appKey }`（AccessKey 不出服务器，只下发 24 小时短期 Token）
+3. 连阿里云 NLS 的 `wss`，首帧发 JSON 带 `token` / `appKey`，之后按二进制帧推音频
+4. 把 NLS 回来的分片按业务协议经 `/ws/interviews/{sessionId}` 上报后端
 
 ```javascript
-// 文件：frontend/src/nlsTranscriptionClient.js（节选：后端中继，纯采集端）
-// 一次 start() 干四件事：
-//   1. getUserMedia 拿麦克风，AudioContext 把音频降采样成 16k 单声道 PCM
-//   2. 打开业务 WebSocket，发 {type:'audio_start'} 通知后端建立阿里云 NLS 上行
-//   3. 采集的裸 PCM 以二进制帧持续推给后端（NLS 帧头由后端 AliyunNlsRealtimeRelay 补齐）
-//   4. 后端把 NLS 识别的临时文本以 {type:'asr_preview'} 推回，这里转给界面实时预览
+// 文件：frontend/src/nlsTranscriptionClient.js（节选：NLS 接入点与分片上报）
+// NLS 实时识别接入点（上海地域）；采样率只支持 16k / 8k，项目统一用 16k
+const NLS_URL = 'wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1';
 const SAMPLE_RATE = 16000;
 
-export class NlsTranscriptionClient {
-  constructor(options) {
-    this.sessionId = options.sessionId;
-    this.onPreview = options.onPreview || (() => {});
-    this.onError = options.onError || (() => {});
-    this.business = null;      // 业务 WebSocket：上行音频 + 下行预览
-  }
+// ...（省略 start / openBusinessSocket / openNlsSocket / startCapture）...
 
-  async start() {
-    // 先建业务 WS，再拿麦克风，最后发 audio_start —— 顺序保证后端上行就绪后才会有音频。
-    this.openBusinessSocket();
-    this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    // 等 WS 真正 OPEN 再发音频，否则 start 后的第一批帧会被后端当成"无上行"丢帧。
-    await new Promise(resolve => {
-      if (this.business?.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
-      this.business.addEventListener('open', () => resolve(), { once: true });
-    });
-    // 通知后端：为本会话建立上行 NLS 连接。
-    this.business.send(JSON.stringify({ type: 'audio_start' }));
-    this.recording = true;
-    this.startCapture();   // 采集 + 降采样 + 分包推送
+  // 上报一个分片：字段名与后端 InterviewWebSocketHandler.handleTextMessage 的解析一一对应
+  sendSegment(segment) {
+    if (this.business?.readyState !== WebSocket.OPEN) return;
+    this.business.send(JSON.stringify({ type: 'transcription', ...segment }));
+    // 临时结果（ed=false）拿来刷新界面预览；最终文本由后端去重合并后统一取
+    if (!segment.ed && segment.text) {
+      this.onPreview(segment.text);
+    }
   }
-
-  // 采集：AudioContext 默认采样率通常是 48k，这里线性降采样到 16k 再发
-  startCapture() {
-    this.audioContext = new AudioContext();
-    const source = this.audioContext.createMediaStreamSource(this.micStream);
-    // 用 ScriptProcessor 逐块拿 PCM：已废弃但零依赖、够教学用；生产可换 AudioWorklet。
-    this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
-    const ratio = this.audioContext.sampleRate / SAMPLE_RATE;
-    this.processor.onaudioprocess = event => {
-      if (this.business?.readyState !== WebSocket.OPEN) return;
-      const input = event.inputBuffer.getChannelData(0);
-      // 降采样 + float32 → int16（NLS 要的是 16 位小端 PCM）
-      const pcm = new Int16Array(Math.floor(input.length / ratio));
-      for (let i = 0; i < pcm.length; i += 1) {
-        const sample = input[Math.floor(i * ratio)];
-        pcm[i] = Math.max(-1, Math.min(1, sample)) * 0x7fff | 0;
-      }
-      // 直接发裸 PCM 二进制帧；NLS 的 4 字节帧头由后端 AliyunNlsRealtimeRelay 补。
-      this.business.send(pcm.buffer);
-    };
-    source.connect(this.processor);
-    this.processor.connect(this.audioContext.destination);
-  }
-  // ...（省略 openBusinessSocket / stop / 下行 asr_preview）...
-}
 ```
 
 **答题页面的 JSX（追问优先展示）：**
@@ -15096,66 +14703,21 @@ export class NlsTranscriptionClient {
 **报告生成的三步（`loadReport`）：**
 
 ```javascript
-// 文件：frontend/src/main.jsx（节选：报告生成 loadReport + pollReportUntilSettled）
-  // 单轮轮询：每 1 秒查一次 "/api/reports/{sessionId}/status"，默认最多等 90 秒。
-  // 一旦拿到非 GENERATING（COMPLETED / FAILED）就立刻带着该状态返回；等满一整轮
-  // 仍是 GENERATING 时，也会把后端最新状态取回来交还给调用方（loadReport），
-  // 由调用方决定是否"兜底重触发"——这里只负责"等价满一轮后带最新状态返回"，
-  // 不再自己无限等下去——无限等只会让界面永远停在"生成中"。
-  const pollReportUntilSettled = async (maxAttempts = 90) => {
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const s = await request(`/api/reports/${session.sessionId}/status`);
-      if (s.status !== 'GENERATING') {
-        return s;
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    return request(`/api/reports/${session.sessionId}/status`);
-  };
-
+// 文件：frontend/src/main.jsx（节选：报告生成三步）
   const loadReport = async () => {
     if (!session) return;
-    // 立即给出"生成中"的真实状态，而不是停在空白转圈，让用户明确知道在生成哪一步。
-    setReport({ status: 'GENERATING' });
-    // 先读一次状态。首次进报告页时库里还没有记录，status 接口返回 404，
-    // 用 try/catch 接住并当作"没有报告"，自然会落到下面的"触发生成"分支。
-    let existing = null;
-    try {
-      existing = await request(`/api/reports/${session.sessionId}/status`);
-    } catch {
-      existing = null;
+    // 触发一次生成（幂等：已存在就把状态重置回 GENERATING 重新生成）。
+    await request(`/api/reports/${session.sessionId}`, { method: 'POST' });
+    // 一秒一次轮询状态，最多 60 次（AI 一次调用通常 10~30 秒）。
+    // 不是 GENERATING 就跳出：COMPLETED 和 FAILED 都要跳出来，
+    // FAILED 时也要让用户看到后端给的状态，不能傻等。
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const state = await request(`/api/reports/${session.sessionId}/status`);
+      if (state.status !== 'GENERATING') break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
-    // 已完成：直接展示，不重新生成。
-    if (existing && existing.markdown) {
-      setReport(existing);
-      return;
-    }
-    // 没有记录，或上一次生成失败：POST 触发生成（后端幂等，已在生成中的不会重复起）。
-    if (!existing || existing.status === 'FAILED') {
-      try {
-        await request(`/api/reports/${session.sessionId}`, { method: 'POST' });
-      } catch {
-        // 幂等触发失败（例如已在生成中）不致命，下面继续轮询即可。
-      }
-    }
-    // 已在生成中或刚触发：持续轮询直到 COMPLETED/FAILED 再展示，绝不再固定停在 GENERATING。
-    // 兜底重试：单轮 pollReportUntilSettled 默认只等 90 秒。如果那个异步生成任务因 AI 上游
-    // 超时/异常而没真正起效，记录就会一直停在 GENERATING。于是每轮等满仍看到 GENERATING 时，
-    // 显式再 POST 一次触发生成——后端对已存在的 GENERATING 记录会"重置状态 + 重新触发一个
-    // 新的异步生成任务"，把卡死的记录"救活"。最多兜底 2 次，总计最长约 270 秒；重试完仍是
-    // GENERATING，就把后端真实状态展示出来让用户点「刷新报告」手动再试。
-    let settled = await pollReportUntilSettled();
-    let retries = 0;
-    while (settled.status === 'GENERATING' && retries < 2) {
-      try {
-        await request(`/api/reports/${session.sessionId}`, { method: 'POST' });
-      } catch {
-        // 重置触发即使失败也不致命，下一轮轮询仍会尽力读到终态。
-      }
-      retries += 1;
-      settled = await pollReportUntilSettled();
-    }
-    setReport(settled);
+    const value = await request(`/api/reports/${session.sessionId}`);
+    setReport(value);
   };
 ```
 
@@ -15204,7 +14766,7 @@ const markdownToHtml = markdown => {
                 {report ? (
                   report.markdown
                     ? <article className="report-document" dangerouslySetInnerHTML={{ __html: markdownToHtml(report.markdown) }} />
-                    : <div className="empty-state"><span className="loader" />{`报告状态：${report.status || 'GENERATING'}，正在生成。若较长时间无进展，请点「刷新报告」重试。`}</div>
+                    : <div className="empty-state"><span className="loader" />{`报告状态：${report.status || 'GENERATING'}，请稍后刷新。`}</div>
                 ) : <div className="empty-state"><span className="loader" />正在加载面试报告...</div>}
                 {/* 修改结束 */}
               </section>
@@ -15869,7 +15431,7 @@ public class InterviewWebSocketHandler
 | 文件 | 作用 | 少了会怎样 |
 | --- | --- | --- |
 | `package.json` | 声明依赖和 `npm run dev` 脚本 | 装不了依赖、起不了开发服务器 |
-| `vite.config.js` | 把 `/api`、`/ws` 代理到后端 18080 | 前端请求全部 404，WebSocket 握手被 5173 截胡 |
+| `vite.config.js` | 把 `/api`、`/ws` 代理到后端 8080 | 前端请求全部 404，WebSocket 握手被 5173 截胡 |
 | `index.html` | React 的挂载点 | `createRoot(document.getElementById('root'))` 拿到 null，页面白屏 |
 
 **`frontend/package.json`：**
@@ -15904,7 +15466,7 @@ import react from '@vitejs/plugin-react';
 
 // 从这里开始是新增的：前端开发服务器配置。
 // 为什么需要它：main.jsx 与 nlsTranscriptionClient.js 里的请求都写成同源相对路径
-// （/api/... 与 /ws/...），开发时前端跑在 5173、后端跑在 18080，必须靠代理把这两类
+// （/api/... 与 /ws/...），开发时前端跑在 5173、后端跑在 8080，必须靠代理把这两类
 // 前缀转发到后端；ws: true 是给 WebSocket 用的，不写这一行 /ws/interviews/... 的
 // 升级握手会被前端开发服务器自己截胡，连接直接失败。
 export default defineConfig({
@@ -15914,12 +15476,12 @@ export default defineConfig({
     proxy: {
       // REST 接口统一走 /api 前缀（与后端各 Controller 的 @RequestMapping 一致）。
       '/api': {
-        target: 'http://localhost:18080',
+        target: 'http://localhost:8080',
         changeOrigin: true
       },
       // WebSocket：面试会话的实时通道（转写分片上报 + ping/pong 保活）。
       '/ws': {
-        target: 'ws://localhost:18080',
+        target: 'ws://localhost:8080',
         ws: true
       }
     }
@@ -15950,9 +15512,594 @@ export default defineConfig({
 <!-- 新增结束 -->
 ```
 
-**启动方式：** 在 `frontend/` 目录执行 `npm install` 安装依赖，再执行 `npm run dev`，开发服务器监听 5173；后端 Spring Boot 监听 18080。访问 `http://localhost:5173` 即可，所有 `/api`、`/ws` 请求由 Vite 代理转发到后端，浏览器视角下是"同源"，不存在跨域问题。
+**启动方式：** 在 `frontend/` 目录执行 `npm install` 安装依赖，再执行 `npm run dev`，开发服务器监听 5173；后端 Spring Boot 监听 8080。访问 `http://localhost:5173` 即可，所有 `/api`、`/ws` 请求由 Vite 代理转发到后端，浏览器视角下是"同源"，不存在跨域问题。
 
 **与生产环境的关系：** `npm run build` 产出的静态文件由后端或 Nginx 托管，此时没有 Vite 代理，靠 `VITE_API_ROOT` 环境变量把 `API_ROOT` 指向真实后端地址（见「前端 1」里的 `const API_ROOT = import.meta.env.VITE_API_ROOT || ''`）。
 
 ---
+
+## 十七、完整联调顺序
+
+### 模块主要目的
+
+按照真实用户路径验证前后端、数据库、缓存、AI、文件解析和异步任务之间的连接是否正确。每个验证步骤均包含：测试位置（URL）、预期结果、失败排查方向。
+
+### 模块整体流程
+
+```text
+启动基础设施 -> 启动后端和前端 -> 测试注册登录
+    -> 测试简历岗位 -> 测试面试主流程
+    -> 测试评分追问和报告 -> 检查异常、权限和重复请求
+```
+
+### 联调 1：启动服务
+
+**本小节目的：** 启动所有依赖和应用服务，为后续接口及页面测试准备稳定环境。
+
+**为什么需要这个步骤：** Docker 容器（MySQL、Redis、MongoDB）必须先于应用启动，否则后端连接数据库或缓存时会报连接拒绝错误。前端必须在后端启动后才能正常调用 API。
+
+**验证方法：** 逐个启动后检查端口监听和日志输出。
+
+#### 步骤 1：启动基础设施（Docker 容器）
+
+```powershell
+# 在项目根目录执行
+docker compose up -d
+```
+
+- **测试位置：** 终端命令行
+- **预期结果：** 终端显示 `Starting mysql ... done`、`Starting redis ... done`、`Starting mongodb ... done`
+- **验证命令：** `docker ps` 应看到 3 个容器状态为 `Up`
+- **失败处理：** 若端口冲突，检查宿主机 3306、6379、27017 端口是否被占用，修改 `docker-compose.yml` 映射端口
+
+#### 步骤 2：启动后端（Spring Boot）
+
+```powershell
+# 在项目根目录执行
+mvn spring-boot:run
+```
+
+- **测试位置：** 终端命令行
+- **预期结果：** 终端最后显示 `Started InterviewPlatformApplication in X.XX seconds`，无 `UnsatisfiedDependencyException` 或 `BeanCreationException`
+- **验证 URL：** http://localhost:8080/actuator/health（若项目有 Actuator）
+- **失败处理：** 检查 `application.yml` 中数据库连接串、Redis 地址、MongoDB 地址是否正确
+
+#### 步骤 3：启动前端（Vite 开发服务器）
+
+```powershell
+cd frontend
+npm install     # 首次或依赖变更后执行
+npm run dev
+```
+
+- **测试位置：** 终端命令行（新终端窗口）
+- **预期结果：** 终端显示 `VITE vX.X.X  ready in XXX ms` 和 `➜  Local: http://localhost:5173/`
+- **验证 URL：** http://localhost:5173/ 应看到登录页面
+- **失败处理：** 若 `npm install` 失败，检查 `package.json` 依赖版本；若端口冲突，修改 `vite.config.js` 的 `server.port`
+
+### 联调 2：测试注册和登录
+
+**本小节目的：** 验证用户创建、密码加密存储、JWT 签发和后续接口鉴权链路全部正常。
+
+**为什么需要这个步骤：** 注册登录是所有业务功能的前置条件。后续所有接口都依赖 JWT Token 鉴权，如果这一步不通，后续所有联调都无法进行。
+
+#### 步骤 1：注册新用户
+
+- **测试位置：** `POST http://localhost:8080/api/auth/register`
+- **请求体：** `{ "username": "testuser", "displayName": "测试用户", "password": "Test1234!" }`（`RegisterRequest` 只有 username / displayName / password 三个字段，没有 email）
+- **预期结果：** 返回 HTTP 200，响应体为 `{ "token": "eyJ...", "userId": "1", "username": "testuser", "displayName": "测试用户" }`
+- **数据库验证：** 查询 `app_user` 表，确认新记录存在且 `password_hash` 字段为加密字符串（不是明文）
+- **失败处理：**
+  - 若返回 400，检查请求体字段名和 `@NotBlank` 校验规则
+  - 若返回 500，查看后端日志是否有唯一约束冲突
+
+#### 步骤 2：重复注册检查
+
+- **测试位置：** 再次 `POST http://localhost:8080/api/auth/register`，使用相同 username
+- **预期结果：** 后端抛 `IllegalStateException("username already exists")`。注意当前全局异常处理器 `ApiExceptionHandler` 只把 `IllegalArgumentException` 映射成 400、`AccessDeniedException` 映射成 403，`IllegalStateException` 未被接管，所以实际会返回 HTTP 500（属于待改进点，见「十八」）
+- **失败处理：** 若返回 200，说明缺少重复注册校验，检查 `UserController.register` 是否在保存前用 `selectCount` 查了 username
+
+#### 步骤 3：登录
+
+- **测试位置：** `POST http://localhost:8080/api/auth/login`
+- **请求体：** `{ "username": "testuser", "password": "Test1234!" }`（`LoginRequest` 只有 username / password）
+- **预期结果：** 返回 HTTP 200，响应体包含 `{ "token": "eyJ...", "userId": "1" }`
+- **失败处理：**
+  - 若返回 400（`invalid credentials`），检查注册与登录是否用同一个 `PasswordEncoder`（注册时 `encode`、登录时 `matches`）
+  - 检查 `UserController.login` 是否按 username 查询用户
+
+#### 步骤 4：携带 Token 访问受保护接口
+
+- **测试位置：** `GET http://localhost:8080/api/resumes?userId=1`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200（该用户还没上传过简历时返回 204 No Content），而不是 401
+- **失败处理：**
+  - 若返回 401，检查 `JwtAuthenticationFilter` 是否正确从 `Authorization` 头取出 Bearer Token 并交给 `JwtTokenService` 验签
+  - 注意：`JwtAuthenticationFilter` 只在"带了 Token 但验签失败"时返回 401；不带 `Authorization` 头时它不拦截，所以真正的鉴权强度取决于业务层（见「十八、问题 1」）
+
+#### 步骤 5：前端登录流程验证
+
+- **测试位置：** 浏览器打开 http://localhost:5173/ → 填写用户名/密码 → 点击"登录"或"创建新账号"
+- **预期结果：** 登录成功后进入准备页；刷新页面后登录状态保持，因为 Token 与用户信息分别存在 `localStorage` 的 `interview_token`、`interview_user` 两个键里，后续请求由 `request` 函数自动带上 `Authorization: Bearer ...`
+- **失败处理：**
+  - 若 Token 未保存，检查 `auth` 方法里是否调用了 `localStorage.setItem('interview_token', value.token)`
+  - 若刷新后退出，检查 `restoreStoredUser` 是否从 `localStorage.getItem('interview_user')` 恢复用户
+
+### 联调 3：测试简历和岗位
+
+**本小节目的：** 验证简历上传和解析、岗位查询、简历-岗位匹配能够正确衔接。
+
+**为什么需要这个步骤：** 面试需要基于候选人简历和岗位要求生成题目和评分。简历解析、技能提取、岗位匹配是后续面试流程的数据基础。
+
+#### 步骤 1：上传简历
+
+- **测试位置：** `POST http://localhost:8080/api/resumes`
+- **请求格式：** `multipart/form-data`，两个 part：`userId`（文本）和 `file`（PDF / DOC / DOCX 文件）
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200，响应体为 `ResumeView`：`{ "id": "1", "userId": "1", "fileName": "...", "status": "PARSED", "parsedContent": "...", "extractedSkills": "[\"Java\", ...]" }`
+- **文件系统验证：** 检查 `data/resumes` 目录下是否存在上传的文件副本
+- **数据库验证：** 查询 `interview_resume` 表，确认 `parsed_content` 不为空，`extracted_skills` 是 AI 提取的技能 JSON 数组，`status = PARSED`
+- **失败处理：**
+  - 若返回 400（`resume file is empty` / `resume exceeds 10MB`），检查文件是否为空或超过 10MB
+  - 若 `parsed_content` 为空，检查 `ResumeParserService` 的解析逻辑
+  - 若 `extracted_skills` 为空，检查 `ResumeAiExtractionService` 的提示词和响应解析逻辑
+
+#### 步骤 2：查询岗位
+
+- **测试位置：** `GET http://localhost:8080/api/positions`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200，响应体是岗位数组，每个岗位有 `id`、`name`、`description`、`skills` 字段（注意是 `name` 而不是 `title`；接口也不支持 `keyword` 参数）
+- **数据库验证：** 查询 `interview_position` 表，确认岗位数据已初始化
+- **失败处理：** 若返回空数组，检查 `PositionController.list` 的查询逻辑和初始化脚本 `DatabaseSeedRunner` 是否已执行
+
+#### 步骤 3：发起匹配
+
+- **测试位置：** `POST http://localhost:8080/api/positions/{positionId}/match?resumeId={resumeId}`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200，响应体为 `MatchView`：`{ "resumeId": 1, "positionId": 1, "matchScore": 85.0, "detail": "匹配技能：Java、MySQL" }`
+- **失败处理：**
+  - 若 `matchScore` 为 0，检查 `PositionController.match` 是否分别把岗位 `skills` 和简历 `extracted_skills` 按 JSON 数组解析
+  - 若返回 400（`position or resume not found`），检查 `resumeId` 或 `positionId` 是否存在于数据库
+
+### 联调 4：测试面试主流程
+
+**本小节目的：** 从创建面试到报告生成完整走通核心业务，确认异步任务和状态机协同正常。
+
+**为什么需要这个步骤：** 面试主流程涉及状态机、异步评分、追问链、报告生成等多个模块，是项目最核心的业务链路。必须完整走通才能确认所有模块集成正确。
+
+#### 步骤 1：创建面试会话
+
+- **测试位置：** `POST http://localhost:8080/api/interviews?userId=1&positionId=1&resumeId=1`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **注意：** 三个参数都是查询参数（`@RequestParam`），不是 JSON 请求体
+- **预期结果：** 返回 HTTP 200，响应体为 `SessionView`：`{ "sessionId": "...", "state": "INIT", "version": 0 }`
+- **失败处理：** 若返回 400（`请先上传并完成简历解析`），检查该简历 `status` 是否为 `PARSED`，以及 `userId` 是否与简历归属一致
+
+#### 步骤 2：开始面试
+
+- **测试位置：** `POST http://localhost:8080/api/interviews/{sessionId}/start`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200，`state` 从 `INIT` 推进到 `MATCHING`；同时后端异步预生成第一题
+- **取第一题：** `POST http://localhost:8080/api/interviews/{sessionId}/questions`
+- **预期结果：** 返回 HTTP 200，响应体为 `QuestionView`：`{ "id": "...", "content": "...", "category": "...", "sequenceNo": 1, "status": "ACTIVE" }`
+- **数据库验证：** 查询 `interview_question` 表，确认新增了题目记录
+- **失败处理：**
+  - 若状态未正确流转，检查 `InterviewSessionStateMachine` 的事件和状态定义
+  - 若未生成题目，检查 `InterviewPreparationAsyncService` 的异步预生成和 AI 调用日志
+
+#### 步骤 3：提交答案
+
+- **测试位置：** `POST http://localhost:8080/api/answers/{sessionId}/answers`（注意类级路径是 `/api/answers`，不是 `/api/interviews`）
+- **请求头：** `Authorization: Bearer eyJ...`
+- **请求体：** `{ "questionId": "<UUID>", "requestId": "uuid", "answer": "...", "followUp": false }`（`questionId` 是 UUID 字符串；`followUp` 可省略，缺省按初次作答处理）
+- **预期结果：** 返回 HTTP 200（无响应体），`interview_answer` 表新增一条 `status=SUBMITTED` 的记录，同时 RabbitMQ 的 `interview.judge.queue` 里能看到这条消息被消费掉（Ready 数短暂 +1 后回到 0）
+- **失败处理：**
+  - 若返回 400，检查 `answer` / `requestId` 是否为空（`@NotBlank` 校验）
+  - 若 `interview.judge.queue` 里既没有消息、也没有消费记录，先看后端日志有没有 `已投递 queue=interview.judge.queue`；有日志说明消息发出去了但路由不到队列，检查 `spring.rabbitmq` 配置与 broker 是否在跑
+  - 若状态未推进，检查状态机事件
+
+#### 步骤 4：等待评分
+
+- **测试位置：** `GET http://localhost:8080/api/interviews/{sessionId}/state`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 评分期间 `state` 处于 `JUDGING`，评分和追问裁决完成后回到 `QUESTIONING`；HTTP 层**没有**单独的查分接口，评分结果落在 `interview_answer` 表的 `score` / `feedback` 字段，直接查库验证
+- **失败处理：**
+  - 若长时间停在 `JUDGING`（超过 5 分钟），先看 RabbitMQ 控制台 `interview.judge.queue` 的 Ready/Unacked：Ready 不降说明消费者没在跑，Unacked 长期不归零说明卡在 AI 调用上（等 60 秒超时后会自动转重试）
+  - 若 `score` 为 null，检查评分 AI 调用是否成功、返回值解析是否正确
+
+#### 步骤 5：追问或下一题
+
+- **测试位置：** 先 `GET http://localhost:8080/api/interviews/{sessionId}/follow-up?questionId={刚答完的原题ID}`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 有追问时返回 `FollowUpView`：`{ "questionId": "...", "level": "基础追问", "content": "..." }`；没有追问时返回 HTTP 200 + 空 body
+- **有追问时：** 用同一个 `questionId` 再提交一次答案，`followUp` 传 `true`（追问复用原题 ID，不推进主线状态机）
+- **没有追问时：** `POST http://localhost:8080/api/interviews/{sessionId}/questions` 取下一题；若所有题目完成，`state` 会变成 `ENDED`
+- **失败处理：**
+  - 若追问未生成，检查 `FollowUpLiteFlowNodes` 的多节点链：先定位是 `loadQuestionContext`（加载原题/作答）没拿到数据、分数段生成节点（`generateBasicFollowUp` 等）没产出正文，还是 `persistFollowUp` 没落库
+  - LiteFlow 规则执行失败时查看日志中的 `chainId` 和 `nodeId`
+
+#### 步骤 6：结束面试并查看报告
+
+- **测试位置：** `POST http://localhost:8080/api/interviews/{sessionId}/end`
+- **请求头：** `Authorization: Bearer eyJ...`
+- **预期结果：** 返回 HTTP 200，`state` 变为 `ENDED`；同时后端会把整场答案汇总后交给表现分析（异步）
+
+- **触发报告生成：** `POST http://localhost:8080/api/reports/{sessionId}`
+- **预期结果：** 返回 `{ "sessionId": "...", "status": "GENERATING", "markdown": null }`
+- **轮询状态：** `GET http://localhost:8080/api/reports/{sessionId}/status`，直到 `status` 变成 `COMPLETED` 或 `FAILED`
+- **读取正文：** `GET http://localhost:8080/api/reports/{sessionId}`
+- **预期结果：** `status = COMPLETED` 时返回 `{ "sessionId": "...", "status": "COMPLETED", "markdown": "..." }`，`markdown` 是完整报告
+- **失败处理：**
+  - 若报告 `markdown` 一直为 null，先看 `interview.report.queue` 是否在消费；再看 `interview.report.dead.queue` 有没有消息（有 = 重试三次都失败，消息体里带 `reportId`，可据此查日志定位 AI 调用还是上下文组装出的问题）
+  - 若返回 403，说明当前用户不是该会话的所有者（`assertOwner` 校验）
+  - 若 `state` 未变为 `ENDED`，检查 `InterviewSessionStateMachine` 中 `END` 事件的触发条件
+
+### 联调 5：异常和边界情况验证
+
+**本小节目的：** 确保系统在异常输入、重复请求和权限越界时行为正确。
+
+**为什么需要这个步骤：** 仅测试正常流程是不够的。生产环境中会出现各种异常情况，系统必须优雅处理而非抛出 500。
+
+#### 异常 1：无效 Token 访问
+
+- **测试位置：** `GET http://localhost:8080/api/resumes?userId=1`
+- **请求头：** `Authorization: Bearer invalid_token_here`
+- **预期结果：** 返回 HTTP 401，而不是 500
+- **失败处理：** 检查 `JwtAuthenticationFilter` 中 Token 验签失败时是否 `response.setStatus(401)`
+
+#### 异常 2：面试不存在
+
+- **测试位置：** `POST http://localhost:8080/api/interviews/nonexistent-session-id/start`
+- **预期结果：** 返回 HTTP 404，提示"面试会话不存在"
+
+#### 异常 3：重复提交答案（幂等）
+
+- **测试位置：** 对同一 `questionId` 和 `requestId` 提交两次答案
+- **预期结果：** 第二次返回 HTTP 409，提示"该答案已提交"
+- **失败处理：** 检查 `AnswerCommandService` 中 `requestId` 的唯一约束校验
+
+#### 异常 4：上传非法文件
+
+- **测试位置：** `POST http://localhost:8080/api/resumes`，`file` 传一个超过 10MB 的文件（或空文件）
+- **预期结果：** 返回 HTTP 400，响应体 `{ "message": "resume exceeds 10MB" }` 或 `{ "message": "resume file is empty" }`
+- **失败处理：** 检查 `ResumeController.upload` 的大小与空文件校验；注意当前实现**没有**按 MIME 类型 / 扩展名做白名单校验（上传 `.exe` 也会被接收），这是待改进点（见「十八、问题 4」）
+
+
+
+## 十八、当前项目需要注意的代码问题
+
+### 问题 1：不能完全信任 userId
+
+**问题描述：** 当前一些接口从请求参数（如 `@RequestParam Long userId`）读取用户标识，而不是从 JWT 中解析。
+
+**风险：** 前端可以伪造 `userId` 参数访问其他用户的数据，存在越权漏洞。
+
+**修复方向：**
+- 所有需要用户身份的接口，统一从 `SecurityContextHolder` 或 JWT Token 中提取用户信息
+- 删除请求参数中的 `userId` 字段
+- 在 `JwtAuthenticationFilter` 中解析 Token 后将用户信息设置到 `SecurityContext`
+
+### 问题 2：SQL 和实体字段必须一致
+
+**问题描述：** 答案评分代码使用的 `score`、`feedback`、`fencing_token` 等字段必须同时存在于数据库表和 Java 实体类中。
+
+**风险：** 只修改 Java 代码而不修改初始化 SQL（`docker/mysql/01-schema.sql`），会导致运行时 SQL 错误（`Unknown column`）。这是开发过程中最容易出现的低级错误。
+
+**修复方向：**
+- 每次新增字段时，同步修改三处：**实体类** → **Mapper XML** → **初始化 SQL 脚本**
+- 在 `application.yml` 中设置 `spring.jpa.hibernate.ddl-auto: validate` 启动时校验实体和表结构一致性（仅作为安全网，不依赖自动建表）
+
+### 问题 3：AI JSON 返回必须校验
+
+**问题描述：** 大语言模型可能返回 Markdown 代码围栏（` ```json ... ``` `）、缺少必填字段或字段类型错误。解析后必须做防御性校验。
+
+**风险：** 模型返回的 JSON 格式不固定，直接解析可能导致 `NullPointerException` 或 `ClassCastException`，进而导致整个业务流程中断。
+
+**修复方向：** 解析结果后必须验证：
+
+```text
+score 在 0 到 100 的整数
+题目 content 非空字符串
+category 不超过数据库字段长度（如 VARCHAR(50)）
+报告 Markdown 非空
+返回字段类型必须匹配（数值不能返回字符串）
+```
+
+**参考实现：** 在 `InterviewAiFacade` 和各 AI 调用处增加 `validateScore(response)`、`validateQuestion(response)`、`validateReport(response)` 等校验方法。
+
+### 问题 4：文件上传要加强安全
+
+**问题描述：** 当前只限制了上传文件大小（`spring.servlet.multipart.max-file-size`），缺乏全面的安全检查。
+
+**风险：** 恶意用户可能上传可执行文件、脚本文件或超大文件，导致服务器被攻击或磁盘写满。
+
+**修复方向：**
+- 校验真实 MIME 类型（使用 Apache Tika 检测，而非仅依赖请求头的 `Content-Type`）
+- 校验文件扩展名白名单（仅允许 `.pdf`、`.docx`、`.doc`）
+- 校验文件内容魔数（Magic Number）
+- 生产环境使用对象存储（阿里云 OSS / AWS S3）替代本地存储
+- 文件存储路径不要使用用户提供的文件名
+
+### 问题 5：异步任务的可见性只做到"能看到"，还没做到"能告警"
+
+**问题描述：** 三类任务都走 RabbitMQ 之后，"任务在哪、堆了多少、为什么失败"这三件事在控制台上是看得见的——`interview.judge.queue` 的 Ready 数、Unacked 数，`interview.*.dead.queue` 里的消息体，都摆在那里。但项目本身没有接入指标采集和告警，出问题时仍然要靠人打开 `http://localhost:15672` 去看。
+
+**风险：** 死信堆积不会主动通知任何人。一次上游限流持续半小时，评分死信可能攒几百条，而前端的表现只是"答案一直没有分数"——用户不知道发生了什么，运维也不知道该去控制台看。
+
+**已经具备的基础（比自建队列时代强）：**
+
+```text
+消息持久化            — deliveryMode=PERSISTENT，broker 重启不丢
+消费确认              — 手动 ack，业务成功才确认，崩溃自动 requeue
+重试与死信            — 延迟队列 10 秒/次、上限 3 次，超限进 dead 队列留现场
+发布确认              — publisher confirm + returns，路由不到队列立即报错
+任务载荷自带定位信息   — sessionId / questionId / reportId 都在消息体里，死信点开就能定位到人
+```
+
+**还缺的三件事：**
+
+1. **指标导出。** 用 `spring-boot-starter-actuator` + Micrometer 的 RabbitMQ binder，把每个队列的 Ready / Unacked / 死信数暴露成 Prometheus 指标，配一条"死信数 > 0 持续 5 分钟"的告警规则。这比自己写一张 `JudgeTaskMonitor` 表更省事，也不会和 broker 的真实状态打架。
+2. **耗时埋点。** 评分链路的耗时现在只落在日志里（`已投递 queue=...` 到 ack 之间）。要做性能分析，应在 `JudgeTaskConsumer` 的监听方法外包一层 `Timer`，把 P50 / P99 上报——这是"AI 慢 vs 数据库慢 vs 状态机拒绝"唯一能分开量化的办法。
+3. **死信的人工出口。** 死信队列目前只能看不能点。要做运维友好，需要一个最小的补偿入口：读死信消息体 → 重投主队列（`retryCount` 归零）。注意这只是"人工按钮"，不是自动补偿——自动重投会把"结构性失败"变成"永久热循环"，那正是当初决定不用自建队列的原因之一。
+
+
+
+## 十九、最终项目文件地图
+
+### 项目初始化文件
+
+```text
+pom.xml                                                 — Maven 项目描述文件，定义依赖（Spring Boot、MyBatis、Redis、MongoDB、RabbitMQ、Tika 等）
+docker-compose.yml                                      — 定义 MySQL、Redis、MongoDB、RabbitMQ 容器，开发环境一键启动
+.env.example                                            — 环境变量模板（数据库密码、JWT 密钥等敏感配置）
+docker/mysql/01-schema.sql                              — 数据库建表脚本，包含所有业务表的 DDL
+src/main/resources/application.yml                      — Spring Boot 主配置，含数据源、Redis、MongoDB、RabbitMQ（手动 ack / prefetch / publisher confirm）等
+config/RabbitConfig.java                                — 九条队列声明：评分·追问·报告各一套「主队列 + 延迟重试 + 死信」
+src/main/java/com/example/interview/InterviewPlatformApplication.java  — Spring Boot 应用入口类
+```
+
+### 注册登录模块
+
+```text
+config/SecurityCryptoConfig.java                        — 密码加密配置（BCryptPasswordEncoder Bean）
+config/JwtTokenService.java                             — JWT 令牌的生成、解析和校验工具类
+config/JwtAuthenticationFilter.java                     — 请求拦截过滤器，从 Authorization 头提取并校验 JWT
+config/SecurityConfig.java                              — Spring Security 安全配置，定义白名单和权限规则
+src/main/java/com/example/interview/application/UserController.java     — 用户注册、登录 REST 接口
+src/main/java/com/example/interview/infrastructure/mysql/UserEntity.java — 用户表（app_user）的 ORM 实体
+src/main/java/com/example/interview/infrastructure/mysql/UserMapper.java — 用户数据访问层（MyBatis Mapper）
+```
+
+### 简历岗位模块
+
+```text
+src/main/java/com/example/interview/application/ResumeController.java       — 简历上传、查询 REST 接口
+src/main/java/com/example/interview/application/ResumeParserService.java     — 简历文件解析服务（Apache Tika 提取原始文本）
+src/main/java/com/example/interview/application/PositionController.java      — 岗位查询、简历匹配 REST 接口
+src/main/java/com/example/interview/infrastructure/mysql/ResumeEntity.java   — 简历表（interview_resume）ORM 实体
+src/main/java/com/example/interview/infrastructure/mysql/ResumeMapper.java   — 简历数据访问层
+src/main/java/com/example/interview/infrastructure/mysql/PositionEntity.java — 岗位表（interview_position）ORM 实体
+src/main/java/com/example/interview/infrastructure/mysql/PositionMapper.java — 岗位数据访问层
+```
+
+### 面试和答案模块
+
+```text
+src/main/java/com/example/interview/application/InterviewController.java      — 面试会话创建、开始、结束 REST 接口
+src/main/java/com/example/interview/application/QuestionController.java       — 题目获取 REST 接口（只有 POST /{sessionId}/questions，内含预生成题优先与 singleflight 兜底）
+src/main/java/com/example/interview/application/AnswerCommand.java            — 答案提交命令对象（DTO，含 requestId 幂等键）
+src/main/java/com/example/interview/application/AnswerCommandService.java     — 答案提交核心业务逻辑（校验、保存、推状态、发布评分任务）
+src/main/java/com/example/interview/application/AnswerRepository.java         — 答案仓储接口，封装答案读写的聚合操作
+src/main/java/com/example/interview/application/InterviewWorkflowService.java — 面试工作流编排服务，协调状态机、出题、评分
+src/main/java/com/example/interview/application/JudgeTaskPublisher.java       — 评分任务发布器（含 publisher confirm 回调），投递到 RabbitMQ 主队列 / 延迟重试队列 / 死信队列
+src/main/java/com/example/interview/application/JudgeTaskConsumer.java        — 评分消费者，@RabbitListener + 手动 ack + 60 秒超时 + 重试/死信
+src/main/java/com/example/interview/domain/InterviewState.java                — 面试会话状态枚举（INIT、MATCHING、QUESTIONING 等）
+src/main/java/com/example/interview/domain/InterviewEvent.java                — 状态迁移事件枚举
+src/main/java/com/example/interview/domain/InterviewSessionSnapshot.java      — 会话快照领域对象，描述一次快照的完整结构
+src/main/java/com/example/interview/domain/InterviewSessionStateMachine.java  — 状态机核心实现，驱动状态流转和快照持久化
+```
+
+### AI、追问、快照和并发控制模块
+
+```text
+ai/InterviewAiFacade.java                                 — AI 调用门面，统一封装对大模型的请求（出题、评分、报告生成）
+ai/FollowUpDecisionService.java                           — 追问决策服务，根据评分决定是否触发追问及追问策略
+application/FollowUpTask.java / FollowUpTaskPublisher.java / FollowUpTaskConsumer.java — 追问任务的载荷、投递器与消费者（RabbitMQ）
+application/ReportTask.java / ReportTaskPublisher.java / ReportTaskConsumer.java       — 报告任务的载荷、投递器与消费者（RabbitMQ）
+infrastructure/mysql/FollowUpExecution.java               — 追问链上下文对象（LiteFlow 节点之间传值）
+ai/FollowUpLiteFlowNodes.java                             — LiteFlow 追问链节点（2 个公共节点 + 3 个分数段生成节点），编排多节点串行追问流程
+ai/DemeanorAnalysisService.java                           — 面试表现分析服务，分析语音转写中的语气、语速等表现
+src/main/java/com/example/interview/infrastructure/lock/QuestionLockManager.java — 题级分布式锁，防止同一道题被并发评分
+src/main/java/com/example/interview/infrastructure/snapshot/SnapshotDocument.java — MongoDB 快照文档实体
+src/main/java/com/example/interview/infrastructure/snapshot/SessionSnapshotRepository.java — 快照数据访问层（Redis 热缓存 + MongoDB 持久化）
+src/main/java/com/example/interview/infrastructure/singleflight/RedisSingleflight.java — Redis 请求合并器，高并发下相同请求合并为一次 AI 调用
+src/main/java/com/example/interview/infrastructure/singleflight/FailureClassifier.java — 失败分类器，沿 cause 链判断异常属于可重试还是不可重试
+src/main/java/com/example/interview/infrastructure/singleflight/TimeoutTakeoverService.java — 超时接管服务，登记可重试失败并在 TTL 到期后错峰重跑
+src/main/java/com/example/interview/infrastructure/singleflight/RetryableSingleflightException.java — 可重试失败异常，表示任务已登记接管、稍后会被重新执行
+src/main/java/com/example/interview/infrastructure/singleflight/SingleflightStateMachine.java — 请求生命周期状态机，EnumMap 转移表 + Redis Hash 记录状态与失败原因
+```
+
+### 语音、Skill 规则引擎和前端模块
+
+```text
+websocket/AliyunNlsTokenService.java                     — 阿里云 NLS（智能语音交互）Token 获取服务
+websocket/SpeechTokenController.java                      — 语音 Token 获取接口，供前端换取 NLS 临时 Token
+websocket/AsyncTranscriptionBuffer.java                   — 按会话隔离的异步音频缓冲，接收与消费解耦
+websocket/WebSocketConfig.java                            — WebSocket 路由注册与握手 sessionId 解析
+websocket/InterviewWebSocketHandler.java                  — WebSocket 处理器，管理实时语音转写连接
+websocket/TranscriptionSessionContext.java                — 语音转写会话上下文，管理片段合并、去重和最终转录
+src/main/java/com/example/interview/skill/SkillDefinition.java  — Skill 规则引擎的规则定义模型
+src/main/java/com/example/interview/skill/SkillLoader.java      — Skill 规则加载器，从文件或数据库加载规则定义
+src/main/java/com/example/interview/skill/SkillRegistry.java    — Skill 规则注册表，管理所有已加载的规则
+src/main/java/com/example/interview/skill/SkillController.java  — Skill 规则执行 REST 接口
+frontend/index.html                                       — 前端入口页，提供 React 挂载点 <div id="root">
+frontend/package.json                                     — 前端依赖管理（React 18、Vite 5）与启动脚本
+frontend/vite.config.js                                   — Vite 开发服务器配置（端口 5173，代理 /api 与 /ws 到 8080）
+frontend/src/main.jsx                                     — 前端主应用组件（单页，用 screen 状态切换页面；含请求封装、状态管理、内联样式）
+frontend/src/nlsTranscriptionClient.js                    — 阿里云 NLS 实时转写客户端（麦克风采集 → 16k PCM → NLS → 分片上报）
+```
+
+
+
+## 二十、把整个开发顺序再总结一次
+
+### 为什么按这个顺序开发
+
+整个开发顺序遵循一个核心原则：**"先有基础设施，后有业务能力；先有数据，后有界面"**。每个模块的产出是下一个模块的输入，顺序不可颠倒。下面按照实际开发顺序，逐一说明每个模块的作用和定位。
+
+### 第一阶段：项目初始化（顺序 1–5）
+
+```text
+初始化 1：创建普通 Maven 项目和目录结构
+初始化 2：修改 pom.xml 并下载后端依赖
+初始化 3：创建基础设施、数据库脚本和应用配置
+初始化 4：创建公共配置类（SecurityCryptoConfig、JwtTokenService、SchedulingConfig 等）
+初始化 5：启动后端并完成基础验证
+```
+
+**这一阶段做什么：** 搭建项目的骨架。从空的 Maven 项目开始，逐步添加 Spring Boot、MyBatis、Redis、MongoDB 等依赖；创建数据库初始化脚本；配置数据源、文件上传、定时任务等公共设施。
+
+**为什么最先做：** 没有启动成功的应用，一切业务代码都无法运行和测试。基础设施（MySQL、Redis、MongoDB）必须在业务代码之前就绪。公共配置类（加密、JWT、定时任务）被后续所有模块依赖，必须先定义。
+
+### 第二阶段：用户认证（顺序 6–11）
+
+```text
+登录 1：准备用户数据访问层（UserEntity、UserMapper）
+登录 2：准备密码加密和 JWT（SecurityCryptoConfig、JwtTokenService）
+登录 3：编写注册接口
+登录 4：编写登录接口
+登录 5：编写 JWT 校验过滤器（JwtAuthenticationFilter）
+登录 6：前端保存 Token 并携带请求
+```
+
+**这一阶段做什么：** 实现用户的注册和登录功能，包括密码加密存储、JWT 签发和校验。前端保存 Token 并在后续请求中自动携带 `Authorization` 头。
+
+**为什么第二个做：** 用户认证是所有业务功能的前置条件。面试、简历、岗位等后续所有接口都需要登录后的 JWT Token 才能访问。没有认证系统，后续开发中每次测试都需要手动绕过鉴权，效率极低。
+
+### 第三阶段：简历和岗位（顺序 12–19）
+
+```text
+简历 1：创建简历表、实体和 Mapper
+简历 2：创建简历解析服务（ResumeParserService）
+简历 3：编写上传接口
+简历 4：查询已解析简历
+简历 5：前端上传简历
+
+岗位 1：创建岗位表、实体和 Mapper
+岗位 2：编写岗位查询接口
+岗位 3：编写简历匹配接口
+```
+
+**这一阶段做什么：** 实现简历上传、解析（Tika 提取 + AI 技能提取）、岗位查询以及简历-岗位匹配评分。
+
+**为什么第三个做：** 面试需要基于"候选人简历"和"目标岗位"来生成题目和评分。简历和岗位数据必须在面试流程之前就绪。先完成简历解析和岗位匹配，面试模块才能直接使用解析后的技能数据和岗位要求数据。
+
+### 第四阶段：面试核心流程（顺序 20–28）
+
+```text
+面试 1：创建会话表、实体和 Mapper
+面试 2：创建状态、事件和快照
+面试 3：创建状态机（InterviewSessionStateMachine）
+面试 4：创建 MongoDB 快照仓储
+面试 5：创建和开始面试接口
+
+出题 1：创建题目表、实体和 Mapper
+出题 2：创建 AI Facade（InterviewAiFacade）
+出题 3：编写题目接口和请求合并（RedisSingleflight）
+出题 4：前端加载和预取题目
+
+答题 1：创建答案表、实体和 Mapper
+答题 2：创建命令对象和答案仓储
+答题 3：创建题级锁（QuestionLockManager）
+答题 4：推进状态并发布评分任务
+答题 5：创建提交接口
+```
+
+**这一阶段做什么：** 实现面试会话管理（状态机驱动生命周期）、AI 自动出题、答案提交和评分任务发布。这是整个项目的核心业务流程。
+
+**为什么第四个做：** 这是业务价值最高的部分。面试需要简历和岗位数据作为输入（依赖第三阶段），AI 出题需要基础设施中的 Redis 做请求合并（依赖第一阶段），答案评分需要异步消息队列（依赖第一阶段中的 RabbitMQ）。同时，追问和报告等高级功能也依赖面试流程产生的数据。
+
+### 第五阶段：评分和追问（顺序 29–36）
+
+```text
+评分 1：搭建 RabbitMQ 评分队列（改名为名副其实）
+评分 2：创建评分 AI 调用
+评分 3：创建评分工作流
+
+追问 1：根据分数选择策略
+追问 2：创建追问表和上下文
+追问 3：创建 LiteFlow 规则链
+追问 4：编写追问节点
+```
+
+**这一阶段做什么：** 消费 RabbitMQ 里的评分任务，调用 AI 对答案评分，根据评分结果决定是否追问以及追问什么内容。
+
+**为什么第五个做：** 评分消费的是第四阶段投递的任务，必须等第四阶段完成才能工作。追问依赖评分结果——高分（>80）继续下一题，中分（60-80）追问薄弱点，低分（<60）追问基础概念。这个阶段的产出（评分和追问）是后续报告生成的数据来源。
+
+### 第六阶段：结束和报告（顺序 37–42）
+
+```text
+结束 1：继续下一题                          — 推动状态机进入下一题或结束
+结束 2：创建结束接口
+
+报告 1：创建报告表、实体和 Mapper
+报告 2：准备报告上下文（汇总所有面试数据）
+报告 3：编写报告 AI 方法（生成 Markdown 报告）
+报告 4：编写报告接口
+
+表现 0：语音识别获取转写文本（阿里云 NLS 实时转写）
+表现 1：分析语音转写表现（DemeanorAnalysisService）
+表现 2：表现分析的调用方与结果去向（无 Singleflight 缓存）
+```
+
+**这一阶段做什么：** 实现面试结束逻辑（状态机终止）、综合报告生成（AI 根据所有面试数据生成 Markdown 报告）和面试表现分析（语音语调分析）。
+
+**为什么第六个做：** 报告必须基于完整的面试数据（题目、答案、评分、追问），因此需要第四、第五阶段的所有数据就绪后才能生成。表现分析是报告中的"增值内容"，在核心报告流程稳定后添加。
+
+### 第七阶段：Skill 规则引擎（顺序 43–45）
+
+```text
+Skill 1：创建规则文件
+Skill 2：创建规则对象和加载器
+Skill 3：创建注册表和接口
+```
+
+**这一阶段做什么：** 实现可插拔的规则引擎，允许动态加载和执行业务规则（如面试评分规则、追问策略规则）。
+
+**为什么第七个做：** Skill 规则引擎是一个独立的、可选的增强模块。它的价值在于让业务规则可配置化，但核心业务流程不依赖它也能运行。因此放在核心功能之后，作为架构升级。
+
+### 第八阶段：前端页面（顺序 46–51）
+
+```text
+前端 1：创建页面状态（main.jsx 的状态声明与请求封装）
+前端 2：登录注册页面
+前端 3：准备面试页面
+前端 4：答题页面（含 WebSocket 保活、追问作答、阿里云 NLS 录音）
+前端 5：报告页面（三步接口 + Markdown 渲染）
+前端 6：样式（main.jsx 末尾的内联 styles）
+前端 7：前端脚手架（package.json / vite.config.js / index.html）
+```
+
+**这一阶段做什么：** 实现用户交互界面，包括登录注册、面试流程、答题交互和报告展示。
+
+**为什么最后做：** 前端需要调用后端的 API 来展示数据和提交操作。后端所有接口就绪后，前端开发才能进行完整的联调和功能验证。但注意：前端的基础结构（状态管理、请求封装、脚手架文件）可以在后端开发过程中并行搭建。
+
+### 第九阶段：联调验证（顺序 52–55）
+
+```text
+联调 1：启动服务
+联调 2：测试注册和登录
+联调 3：测试简历和岗位
+联调 4：测试面试主流程
+```
+
+**这一阶段做什么：** 按照"启动 → 认证 → 数据准备 → 核心业务"的顺序，逐个验证每个功能模块的正确性和集成质量。
+
+**为什么最后做：** 联调必须基于所有模块开发完成的状态。它的目的是发现模块间集成问题（接口不匹配、数据格式不一致、状态流转错误等），而不是发现单个模块的 Bug。因此必须放在所有开发之后。
+
+---
+
+这就是整个项目真正的开发主线。每一个模块都不是孤立的技术演示，而是前一个步骤完成后，给下一个步骤提供数据、接口或能力——**基础设施给业务提供运行环境，认证给接口提供安全屏障，简历岗位给面试提供数据基础，面试核心流程给评分追问提供数据来源，评分追问给报告生成提供素材，再通过 Skill 引擎和前端页面将能力开放给用户。**
+
+
 

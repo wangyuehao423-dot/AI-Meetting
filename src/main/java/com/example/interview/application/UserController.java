@@ -83,8 +83,11 @@ public class UserController
                 request.password(),
                 user.getPasswordHash()
         )) {
-            throw new IllegalArgumentException(
-                    "invalid credentials"
+            // 凭证不对是「认证失败」不是「参数不合法」：
+            // 抛 AuthException → 401。用户不存在和密码错故意给同一句话，
+            // 避免把它变成「这个用户名注册过没有」的探测接口。
+            throw new AuthException(
+                    "用户名或密码错误"
             );
         }
 

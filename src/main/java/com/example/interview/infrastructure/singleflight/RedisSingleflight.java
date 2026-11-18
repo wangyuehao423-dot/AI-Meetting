@@ -44,6 +44,12 @@ public class RedisSingleflight {
     private final ConcurrentHashMap<String, Long> localFenceTokens =
             new ConcurrentHashMap<>();
 
+    // 本节点"正在执行 producer"的 key → 开始执行的时间。
+    // 心跳线程只给这张表里的 key 打拍：没在执行就没必要续，进程崩了这张表跟着消失，
+    // 等待方读到的就是"心跳停在崩溃前那一刻"，8 秒后判定接管。
+    private final ConcurrentHashMap<String, Long> inFlight =
+            new ConcurrentHashMap<>();
+
     // Spring Data Redis 的操作模板，用于执行 Redis 命令和 Lua 脚本。
     private final StringRedisTemplate redis;
     private final FailureClassifier failureClassifier;
@@ -236,8 +242,13 @@ public class RedisSingleflight {
         }
         // 情况二：抢到锁，执行 producer 并将结果写入缓存。
         if ("OWNER".equals(decisionType)) {
+            stateMachine.transit(key, SingleflightStateMachine.State.RUNNING);
+            // 抢到执行权 → 登记进 inFlight 并立刻打第一拍心跳。
+            // 顺序不能反：先登记再执行 producer，否则 producer 卡住的那段时间里
+            // 等待方读不到任何心跳，会把"正在跑"误判成"已死亡"。
+            inFlight.put(key, System.currentTimeMillis());
+            stateMachine.touchHeartbeat(key);
             try {
-                stateMachine.transit(key, SingleflightStateMachine.State.RUNNING);
                 String result = runProducer(key, ttl, producer);
                 redis.opsForValue().set(
                         valueKey,
@@ -246,12 +257,20 @@ public class RedisSingleflight {
                 );
                 return result;
             } finally {
+                // 先把 key 从心跳表摘掉，再释放锁：摘的越早，越不会出现
+                // "已经结束却还在续心跳"的假活信号。
+                inFlight.remove(key);
                 // 无论 producer 成功还是抛出异常，都必须释放锁。
                 redis.delete(lockKey);
             }
         }
 
-        // 情况三：未抢到锁时轮询等待结果，超时后自行调用，保持原有兜底逻辑。
+        // 情况三：未抢到锁时轮询等待结果。
+        // 等待不是闷头等满 30 秒：每一轮都先问一句"执行方还活着吗"，据此分三种走法——
+        //   · 执行方已判失败 → 立刻抛错，不让用户陪着一个已经死掉的请求白等；
+        //   · 心跳超过 8 秒没更新 → 进程大概率被 kill 或卡死，登记接管后抛可重试异常，
+        //     由接管服务在 TTL 过期后重跑（围栏令牌保证旧执行方的结果不会覆盖新结果）；
+        //   · 心跳正常 → 继续等 50 毫秒再看。
         long deadline = System.nanoTime()
                 + TimeUnit.SECONDS.toNanos(30);
         while (System.nanoTime() < deadline) {
@@ -261,6 +280,29 @@ public class RedisSingleflight {
                 cost.recordHit(key);
                 // 新增结束
                 return result;
+            }
+
+            // 失败已定：等下去不会变好，直接失败并把原因带出去。
+            if (stateMachine.current(key)
+                    == SingleflightStateMachine.State.FAILED) {
+                throw new IllegalStateException(
+                        "singleflight producer failed: "
+                                + stateMachine.reason(key)
+                );
+            }
+
+            // 心跳存活判定。age < 0 表示执行方刚抢到锁、第一拍还没落地的毫秒级窗口，
+            // 这属于正常情况，不能当成死亡信号误杀。
+            long heartbeatAge = stateMachine.heartbeatAgeMs(key);
+            if (heartbeatAge >= 0
+                    && heartbeatAge > SingleflightStateMachine.HEARTBEAT_TIMEOUT_MS) {
+                takeover.register(key, ttl, producer);
+                throw new RetryableSingleflightException(
+                        "executor heartbeat lost ("
+                                + heartbeatAge
+                                + "ms), registered for timeout takeover",
+                        null
+                );
             }
             // 每次轮询间隔 50 毫秒，避免高频空转消耗 CPU。
             // 这里把“线程休眠”的小操作直接内联进轮询循环，因为它只在本处使用一次，
@@ -347,6 +389,42 @@ public class RedisSingleflight {
             );
         }
     }
+    /**
+     * 心跳续期：每 2 秒给本节点正在执行的每一次 producer 打一拍。
+     *
+     * <p>为什么需要它：等待方只靠"结果缓存有没有出现"来判断进度，就分不清
+     * "执行方还在跑"和"执行方已经死了"——两种情况表现完全一样，只能盲等到超时。
+     * 有了心跳，执行方活着就续拍、死了就停拍，等待方读时间戳就能在 8 秒内做出判断。
+     *
+     * <p>为什么只给 inFlight 里的 key 打拍：心跳是"我在干活"的信号，没在干活就不该发；
+     * 进程被 kill 时这张表随进程消失，心跳自然停在上一次，这正是我们要的语义。
+     */
+    @Scheduled(fixedDelay = 2_000)
+    public void beatInFlight() {
+        if (inFlight.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, Long> entry : inFlight.entrySet()) {
+            String key = entry.getKey();
+            // 已经跑完/失败的从表里摘掉，别让一个结束的请求还在续"假活"心跳。
+            SingleflightStateMachine.State state = stateMachine.current(key);
+            if (state != null && state.terminal()) {
+                inFlight.remove(key);
+                continue;
+            }
+            try {
+                stateMachine.touchHeartbeat(key);
+            } catch (RuntimeException ignored) {
+                // 单次续期失败（Redis 抖动）不中断其它 key：少一拍不会立刻被判死亡，
+                // 下一轮会补上；真的连续丢拍，等待方按超时接管，语义仍然正确。
+            }
+            // 兜底：producer 异常长时间不返回时，不要让这张表无限增长。
+            if (System.currentTimeMillis() - entry.getValue() > 10 * 60_000L) {
+                inFlight.remove(key);
+            }
+        }
+    }
+
     @Scheduled(fixedDelay = 600_000)
     public void clearExpiredLocalCache() {
         long now = System.currentTimeMillis();

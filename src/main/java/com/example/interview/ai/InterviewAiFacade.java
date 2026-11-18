@@ -20,9 +20,10 @@ public class InterviewAiFacade {
     private final ChatClient chatClient;
     private final RedisSingleflight singleflight;
     // 从这里开始是新增的：业务 Skill 注册表。
-    // 出题 / 评分 / 报告 / 追问四条 AI 调用各自的业务约束都以 Markdown 规则文件
-    // 的形式放在 resources/skills 下，由 SkillRegistry 启动时统一加载；
+    // 出题 / 评分 / 报告 / 追问四条 AI 调用各自的业务约束都以 Markdown 规则的形式托管在 Nacos 配置中心，
+    // 由 SkillRegistry 在启动时拉取（拉不到的用 resources/skills 下打包的文件兜底）并监听变更；
     // 注入到门面后，四条链路才能通过 skillPrompt(name) 把这些规则拼进提示词。
+    // 规则在 Nacos 上改完点发布即生效，不需要重新打包发布本应用。
     private final SkillRegistry skills;
     // 新增结束
 
@@ -500,14 +501,15 @@ public JudgeResult judge(UUID sessionId, UUID questionId, String answer,
                 你是一名面试表达分析助手。
                 请只分析候选人的语言表达表现，不评价技术正确性。
                 不要编造语音、视频、表情或肢体动作信息。
+                输入只有文本，没有音频时长，因此不要输语速相关的字段。
                 请返回严格的 JSON 对象，不要返回 Markdown 代码围栏或额外解释。
+                confidence 与 clarityScore 必须是 0.0 到 1.0 之间的小数（例如 0.65），不要用 65 这样的百分数。
                 JSON 必须包含以下字段：
                 {
-                  "confidence": 0,
+                  "confidence": 0.0,
                   "fillerCount": 0,
                   "transcriptLength": 0,
-                  "clarityScore": 0,
-                  "pace": "normal",
+                  "clarityScore": 0.0,
                   "feedback": ""
                 }
                 sessionId：%s

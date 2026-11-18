@@ -39,12 +39,6 @@ public class AsyncConfig {
                 new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
-    @Bean(name = "followUpTaskExecutor")
-    public Executor followUpTaskExecutor() {
-        return executor("follow-up-", 2, 4, 50,
-                new ThreadPoolExecutor.CallerRunsPolicy());
-    }
-
     @Bean(name = "reportGenerationTaskExecutor")
     public Executor reportGenerationTaskExecutor() {
         return executor("report-generation-", 2, 4, 30,

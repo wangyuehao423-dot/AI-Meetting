@@ -37,7 +37,7 @@ public class JwtCurrentUserIdProvider
                 RequestContextHolder.getRequestAttributes();
         if (!(attributes instanceof ServletRequestAttributes servlet)) {
             // 不在 HTTP 请求线程里：直接失败，绝不返回默认用户。
-            throw new IllegalStateException(
+            throw new AuthException(
                     "no HTTP request is bound to current thread"
             );
         }
@@ -47,8 +47,11 @@ public class JwtCurrentUserIdProvider
         Object value = request.getAttribute("userId");
         // 属性必须是数字：缺失说明 JWT 没验过或过滤器没接线，同样直接失败。
         if (!(value instanceof Number number)) {
-            throw new IllegalStateException(
-                    "validated JWT userId is missing"
+            // 用 AuthException 而不是 IllegalStateException：这是"没带 token / token 无效"，
+            // 属于认证失败，必须回 401 让前端跳登录页；
+            // 之前抛 IllegalStateException 被全局处理器映射成 409，语义完全错了。
+            throw new AuthException(
+                    "未登录或登录已失效，请重新登录"
             );
         }
         return number.longValue();

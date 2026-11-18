@@ -11,6 +11,7 @@ import com.yomahub.liteflow.flow.LiteflowResponse;
 import com.example.interview.domain.InterviewEvent;
 import com.example.interview.domain.InterviewSessionSnapshot;
 import com.example.interview.domain.InterviewSessionStateMachine;
+import com.example.interview.domain.InterviewState;
 import com.example.interview.infrastructure.snapshot.SessionSnapshotRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -77,6 +78,19 @@ public class FollowUpGenerationService {
      * 4. 触发下一题预生成
      */
     public void generate(FollowUpTask task) {
+        // 面试已经结束就直接丢弃这条追问任务，既不调模型也不推进状态。
+        // 为什么必须先判这一手：用户答完最后一题就点「结束」，而此时评分/追问任务
+        // 还在队列里排队。追问照样会跑完整条链（一次 AI 调用 + 一次落库），
+        // 到推进 ASK_COMPLETED 时才撞上「ENDED 不能变 QUESTIONING」的非法转换，
+        // 异常被消费者当成失败重试 3 次，最后进死信——一次结束面试白烧 4 次模型调用，
+        // 还在死信队列里留下永远查不清的脏数据。
+        // ENDED 是终态：终态之后的追问任务不是「失败」，是「已经没有意义」，跳过即可。
+        InterviewSessionSnapshot snapshot = snapshots.load(task.sessionId());
+        if (snapshot != null && snapshot.state() == InterviewState.ENDED) {
+            log.info("面试已结束，跳过追问任务: sessionId={}, questionId={}",
+                    task.sessionId(), task.questionId());
+            return;
+        }
         // 从这里开始是修改的：整段生成逻辑包进 try-catch。追问是加分项，
         // 它失败绝不能把状态停死在 ASKING 让用户无限转圈——所以无论成败，
         // 最后都会把状态推进到 QUESTIONING（completeAndPreGenerate 会预生成下一题）。
@@ -141,11 +155,24 @@ public class FollowUpGenerationService {
         // 尝试推进 ASK_COMPLETED 事件
         // 为什么用 UUID.randomUUID() 作为事件 ID：
         // 事件 ID 用于幂等性，随机 UUID 确保每次事件是唯一的
-        var moved = machine.advance(
-                old,
-                InterviewEvent.ASK_COMPLETED,
-                UUID.randomUUID().toString()
-        );
+        //
+        // 这里必须容忍「非法转换」：会话可能在这条追问任务排队期间被用户结束（ENDED），
+        // 也可能被并发的评分/取题推到了别的位置。advance 遇到不允许的转换会抛
+        // IllegalStateException，一旦放它冒出去，消费方会当成「追问失败」重试三次并进死信——
+        // 而事实是这个状态推进本来就不该发生，重试一万次也一样。
+        // 正确语义：状态已经不是 ASKING 了就什么都不做，安静退出。
+        InterviewSessionStateMachine.TransitionResult moved;
+        try {
+            moved = machine.advance(
+                    old,
+                    InterviewEvent.ASK_COMPLETED,
+                    UUID.randomUUID().toString()
+            );
+        } catch (IllegalStateException e) {
+            log.warn("会话状态已推进，跳过 ASK_COMPLETED: sessionId={}, state={}, reason={}",
+                    sessionId, old == null ? "null" : old.state(), e.getMessage());
+            return;
+        }
 
         // 只有状态真的变了才 CAS 更新快照
         // 为什么需要检查 changed：

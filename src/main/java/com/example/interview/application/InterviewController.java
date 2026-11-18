@@ -30,6 +30,10 @@ public class InterviewController
     // 从这里开始是新增的：会话恢复服务。用来在重连时把中断的异步步骤幂等补跑，
     // 兑现亮点2里"主动恢复 + 幂等补偿"那一环（详见 SessionRecoveryService 类头注释）。
     private final SessionRecoveryService recovery;
+    // 从这里开始是新增的：当前登录用户提供者。
+    // 为什么需要：create 的 userId 来自请求参数（可伪造），state/recover 更是
+    // 完全没校验归属——任何人拿一个 sessionId 就能读状态、触发补跑。
+    private final CurrentUserIdProvider currentUser;
     // 新增结束
 
 
@@ -42,7 +46,8 @@ public class InterviewController
             InterviewPreparationAsyncService preparationTasks,
             FollowUpRepository followUps,
             // 从这里开始是新增的：构造器末尾追加恢复服务（Spring 按类型注入）。
-            SessionRecoveryService recovery
+            SessionRecoveryService recovery,
+            CurrentUserIdProvider currentUser
             // 新增结束
     ) {
         this.resumes = resumes;
@@ -52,12 +57,54 @@ public class InterviewController
         this.preparationTasks = preparationTasks;
         this.followUps = followUps;
         this.recovery = recovery;
+        this.currentUser = currentUser;
+    }
+
+    /**
+     * 校验「请求声称的用户」就是「token 里的用户」。
+     *
+     * <p>不带 token → currentUserId() 抛 AuthException → 401；
+     * 参数写的是别人 → 403。这样 userId 参数从「身份来源」降级为「一致性校验」，
+     * 既堵住越权，又不破坏既有调用方（它们传的本来就是自己的 id）。</p>
+     */
+    private long resolveUserId(long requested) {
+        long actual = currentUser.currentUserId();
+        if (requested != actual) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "不能操作他人的面试会话");
+        }
+        return actual;
+    }
+
+    /**
+     * 校验会话确实属于当前用户。
+     *
+     * <p>用于没有 userId 参数的接口（state / recover）：先从会话表拿到 owner，
+     * 再和 token 里的身份比。会话不存在回 404，属于别人回 403——
+     * 两者必须分开，否则「猜 sessionId」会变成探测别人会话是否存在的接口。</p>
+     */
+    private InterviewSessionEntity ownedSession(UUID sessionId) {
+        long actual = currentUser.currentUserId();
+        InterviewSessionEntity session = sessionMapper.selectById(sessionId.toString());
+        if (session == null) {
+            throw new NotFoundException("interview session not found");
+        }
+        if (session.getUserId() == null || session.getUserId() != actual) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                    "不能访问他人的面试会话");
+        }
+        return session;
     }
     @PostMapping
     public SessionView create(@RequestParam("userId") Long userId,
                               @RequestParam("positionId") Long positionId,
                               @RequestParam("resumeId") Long resumeId)
     {
+        // 先钉身份：userId 必须等于 token 里的本人。
+        // 不加这一句的话，只要拿到别人的 resumeId，就能用别人的 userId 建出一场
+        // 属于别人的面试——下面那段"resume 属于 userId"的校验拦不住，
+        // 因为它比对的两个值都来自攻击者可控的参数。
+        userId = resolveUserId(userId);
         var resume = resumes.selectById(resumeId);
         if (resume == null
                 || !Objects.equals(
@@ -112,6 +159,8 @@ public class InterviewController
     @PostMapping("/{sessionId}/start")
     public SessionView start(@PathVariable("sessionId") UUID sessionId)
     {
+        // start 会触发 prepare（真实调模型生成题目），必须确认是本人。
+        ownedSession(sessionId);
         var oldValue = snapshots.load(sessionId);
         var result = machine.advance(oldValue, InterviewEvent.START, UUID.randomUUID().toString());
         save(oldValue, result.snapshot());
@@ -137,6 +186,10 @@ public class InterviewController
     @GetMapping("/{sessionId}/state")
     public SessionView state(@PathVariable("sessionId") UUID sessionId)
     {
+        // 先确认这场面试是本人的：不带 token 会 401，别人的会话会 403。
+        // 之前这里没有任何校验——随便一个 sessionId 都能读到会话状态，
+        // 拿它当「这个 id 存在不存在」的探测器。
+        ownedSession(sessionId);
         // 直接读快照当前状态：Redis 未命中时会懒加载 MongoDB，不会改任何状态。
         return view(sessionId, snapshots.load(sessionId));
     }
@@ -158,6 +211,8 @@ public class InterviewController
     public SessionRecoveryService.RecoveryResult recover(
             @PathVariable("sessionId") UUID sessionId
     ) {
+        // 补跑会真的调模型、写库，比读状态更不能让外人触发。
+        ownedSession(sessionId);
         return recovery.recover(sessionId);
     }
     // 新增结束
@@ -185,6 +240,8 @@ public class InterviewController
     public FollowUpView followUp(@PathVariable("sessionId") UUID sessionId,
                                  @RequestParam("questionId") UUID questionId)
     {
+        // 追问内容是答案相关的敏感数据，同样按所有者校验。
+        ownedSession(sessionId);
         return followUps.find(sessionId, questionId);
     }
     // 新增结束
@@ -194,6 +251,8 @@ public class InterviewController
             @PathVariable("sessionId") UUID sessionId
     )
     {
+        // 结束面试是写操作，必须本人。
+        ownedSession(sessionId);
         com.example.interview.domain.InterviewSessionSnapshot oldValue = snapshots.load(sessionId);
 InterviewSessionStateMachine.TransitionResult result = machine.advance(oldValue, InterviewEvent.END, UUID.randomUUID().toString());
         save(oldValue, result.snapshot());

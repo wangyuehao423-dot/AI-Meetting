@@ -47,7 +47,7 @@ public class PositionController {
     public PositionView detail(@PathVariable("id") long id) {
         PositionEntity position = positions.selectById(id);
         if (position == null) {
-            throw new IllegalArgumentException("position not found");
+            throw new NotFoundException("position not found: " + id);
         }
         return view(position);
     }
@@ -68,7 +68,7 @@ public class PositionController {
         ResumeEntity resume = resumes.selectById(resumeId);
 
         if (position == null || resume == null) {
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                     "position or resume not found"
             );
         }

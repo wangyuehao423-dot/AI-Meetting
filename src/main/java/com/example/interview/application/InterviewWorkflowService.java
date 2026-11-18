@@ -122,7 +122,7 @@ public class InterviewWorkflowService {
                 score = fallbackScore();
             }
             // 修改结束
-            // 幂等回放：追问评分任务可能被重复投递（消费者崩溃后补偿重投），
+            // 幂等回放：追问评分任务可能被重复投递（消费者写完分数还没 ack 就崩溃，消息被 broker 重投），
             // 若 is_follow_up=1 那一行已有分数，直接回放，避免重复调用 AI、重复写库。
             var persisted = answers.findJudge(sessionId, questionId, true);
             if (persisted != null)
@@ -181,7 +181,10 @@ public class InterviewWorkflowService {
                             .state(),
                     persisted.feedback(),        // 已保存的反馈
                     false,                       // 不是过期结果
-                    persisted.fencingToken(),    // 已保存的令牌
+                    // 已保存的令牌；历史数据里这一列可能还是 NULL（修复前的行），
+                    // 兜底成 0 而不是让它拆箱炸掉——令牌只用于「旧结果不许覆盖新结果」
+                    // 的版本比较，0 必然小于任何真实令牌，语义上等价于「最旧的一次」。
+                    persisted.fencingToken() == null ? 0L : persisted.fencingToken(),
                     // 末位字段已由 replayed 改为 hasFollowUp：异步化之后 judge 返回时追问必然还没生成，
                     // 所以这里固定给 false（"是否重放"不再由这个字段表达）。
                     false
@@ -240,7 +243,7 @@ public class InterviewWorkflowService {
 
         // 从这里开始是修改的：原来这里是同步调 followUpGeneration.generate(new FollowUpTask(...))，
         // 会当场跑完整条 LiteFlow 追问链才返回，评分队列吞吐被追问 AI 拖死。
-        // 现在只把任务丢进 Redis 队列就返回，追问由独立消费者生成并落库。
+        // 现在只把任务投进 RabbitMQ 的 interview.follow-up.queue 就返回，追问由独立消费者生成并落库。
         // 评分落库、状态推进之后才发布追问任务，任务只带三样东西：哪个会话、哪道题、多少分
         // （走哪条链由消费端的 decide 再算一次，任务体保持最小）。
         // 顺序不能反：先发任务的话，消费者可能比评分落库更快到达，链上就会读到"还没有分数"的上下文。

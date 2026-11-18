@@ -46,14 +46,7 @@ ALTER TABLE interview_follow_up
 ALTER TABLE interview_resume
     ADD COLUMN extracted_skills LONGTEXT NULL AFTER parsed_content;
 
--- 评分补偿日志表（补偿重投超上限时记一笔，供运维排查失败原因）
-CREATE TABLE IF NOT EXISTS interview_judge_compensation_log (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    answer_id BIGINT NOT NULL,
-    retry_count INT NOT NULL,
-    reason VARCHAR(500) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_compensation_log_answer
-        FOREIGN KEY (answer_id) REFERENCES interview_answer (id),
-    INDEX idx_compensation_log_answer (answer_id)
-) ENGINE = InnoDB;
+-- 评分补偿日志表：已废弃，这里负责把老库里的残余表删掉。
+-- 评分队列改成 RabbitMQ 后，重试与死信由 broker 承担，业务侧不再记账
+-- （原 JudgeTaskCompensationService 已删除，代码里没有任何写入方）。
+DROP TABLE IF EXISTS interview_judge_compensation_log;

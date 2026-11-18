@@ -94,12 +94,13 @@ CREATE TABLE IF NOT EXISTS interview_answer (
     feedback LONGTEXT,
     fencing_token BIGINT,
     status VARCHAR(32) NOT NULL DEFAULT 'SUBMITTED',
-    -- 从这里开始是新增的：追问作答标记与补偿重试计数。
+    -- 从这里开始是新增的：追问作答标记与历史重试计数。
     -- is_follow_up：false(0) = 初次作答，true(1) = 追问作答。追问复用原题的
     -- question_id 提交，只能靠这一列区分"同一道题的两次作答"，否则追问答案会
     -- 撞上 uk_answer_question 被当成重复提交静默丢弃。
     is_follow_up TINYINT(1) NOT NULL DEFAULT 0,
-    -- retry_count：异步补偿重投评分任务的次数，超过上限就把 status 置为 JUDGE_FAILED。
+    -- retry_count：历史字段，早期补偿重投评分任务的计数。现在重试次数跟着 RabbitMQ
+    -- 消息体的 retryCount 走，这一列只留档排查用，不再参与逻辑判断。
     retry_count INT NOT NULL DEFAULT 0,
     -- 新增结束
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -153,21 +154,11 @@ CREATE TABLE IF NOT EXISTS interview_report (
         FOREIGN KEY (session_id) REFERENCES interview_session (id)
 ) ENGINE = InnoDB;
 
--- 从这里开始是新增的：评分补偿日志表。
--- JudgeTaskCompensationService 在"队列里找不到对应评分任务、且补偿次数超过上限"时，
--- 除了把 interview_answer 标记为 JUDGE_FAILED，还会往这张表插一条记录，
--- 供运维排查失败原因与重试分布。没有这张表，补偿到上限的那一步会直接抛异常。
-CREATE TABLE IF NOT EXISTS interview_judge_compensation_log (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    answer_id BIGINT NOT NULL,
-    retry_count INT NOT NULL,
-    reason VARCHAR(500) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_compensation_log_answer
-        FOREIGN KEY (answer_id) REFERENCES interview_answer (id),
-    INDEX idx_compensation_log_answer (answer_id)
-) ENGINE = InnoDB;
--- 新增结束
+-- 评分补偿日志表已废弃（原 JudgeTaskCompensationService 专用）。
+-- 评分队列改造为 RabbitMQ 之后，失败重试由 broker 的 retry 队列 + 死信队列承担，
+-- 「补偿次数超上限」这件事变成死信队列里的一条消息，不再需要业务侧自己记账，
+-- 因此代码里已经没有任何地方写这张表。留着它只会让人误以为还有一套补偿逻辑在跑。
+-- 老库里的残余表由 02-upgrade.sql 负责 DROP。
 
 -- ============================================================
 -- 已有数据库的升级脚本（新库不需要执行）

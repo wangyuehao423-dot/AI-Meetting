@@ -59,6 +59,17 @@ public class QuestionController {
     // 新增结束
     // Jackson JSON 处理器，用于将对象序列化为 JSON 或反序列化 JSON 为对象。
     private final ObjectMapper mapper;
+    // 从这里开始是新增的：当前登录用户提供者。
+    // 取题接口会真的调模型生成新题并落库，必须确认这场面试是本人的，
+    // 否则任何人拿一个 sessionId 就能消耗别人的额度、往别人的面试里插题。
+    private final CurrentUserIdProvider currentUser;
+    // 新增结束
+    // 从这里开始是新增的：取题时等待「评分/追问闭环」的上限（秒）。
+    // 为什么抽成配置：原来是硬编码 60 秒，而评分 AI 超时是 30 秒、追问链还要再跑一次
+    // 模型调用，上游一慢就必然撞线——实测出现过「追完 70 秒才闭环、取题在 60 秒抛 409」
+    // 的情况，前端只能看到一个可重试错误。放宽到 120 秒并允许按环境调。
+    private final long readinessTimeoutSeconds;
+    // 新增结束
 
     public QuestionController(
             // 面试会话 Mapper，由 Spring 自动注入。
@@ -77,7 +88,10 @@ public class QuestionController {
             SessionSnapshotRepository snapshots,
             // 新增结束
             // JSON 处理器实例，由 Spring 自动注入。
-            ObjectMapper mapper, PositionController positionController
+            ObjectMapper mapper, PositionController positionController,
+            CurrentUserIdProvider currentUser,
+            @org.springframework.beans.factory.annotation.Value(
+                    "${app.interview.readiness-timeout-seconds:20}") long readinessTimeoutSeconds
     ) {
         this.sessions = sessions;
         this.positions = positions;
@@ -88,6 +102,8 @@ public class QuestionController {
         this.snapshots = snapshots;
         this.mapper = mapper;
         this.positionController = positionController;
+        this.currentUser = currentUser;
+        this.readinessTimeoutSeconds = readinessTimeoutSeconds;
     }
     @PostMapping("/{sessionId}/questions")
     public QuestionView nextQuestion(@PathVariable("sessionId") UUID sessionId) throws JsonProcessingException
@@ -95,9 +111,16 @@ public class QuestionController {
         InterviewSessionEntity session = sessions.selectById(sessionId.toString());
         if(session == null)
         {
-            throw new IllegalArgumentException(
+            throw new NotFoundException(
                 "interview session not found"
             );
+        }
+        // 归属校验：不带 token → 401；会话属于别人 → 403。
+        // 放在查题之前，避免"先生成一道题再发现不是本人"白烧一次模型调用。
+        long actual = currentUser.currentUserId();
+        if (session.getUserId() == null || session.getUserId() != actual) {
+            throw new org.springframework.security.access.AccessDeniedException(
+                "不能获取他人面试的题目");
         }
         PositionEntity position = positions.selectById(session.getPositionId());
         ResumeEntity resume = resumes.selectById(session.getResumeId());
@@ -115,8 +138,14 @@ public class QuestionController {
         // 所以取题前先等快照离开 MATCHING（prepare 至少完成岗位匹配推进），
         // 之后同步兜底生成的题在 QUESTIONING/ANSWERING 状态下作答都是合法转移。
         // JUDGING/ASKING 同理：评分（JUDGE_DONE→ASKING）与追问（ASK_COMPLETED→QUESTIONING）
-        // 未闭环时提交答案也是非法转移。三者统一在这里轮询等待；超时（60s）抛可重试异常，
+        // 未闭环时提交答案也是非法转移。三者统一在这里轮询等待；超时抛可重试异常，
         // 让前端稍后重试，而不是带着坏状态返回一道不能答的题。
+        //
+        // 单次等待只给 20 秒（原来是 120 秒）：
+        // 原来的写法是「一个请求在服务端死等 2 分钟，等不到才回 409」，而前端又按 1.5 秒
+        // 间隔重试——两个 2 分钟叠在一起，实测一次取题能堵住十几分钟，界面上就是彻底卡死。
+        // 现在服务端快速回 409（20 秒内），由前端按总时长（150 秒）继续重试，
+        // 等待期间界面一直显示"正在评分并生成下一题"，既不会假死，也不会一直占着线程。
         InterviewSessionSnapshot snapshot = snapshots.load(sessionId);
         // 从这里开始是新增的：会话已结束时拒绝取题。
         // 为什么必须加：面试结束后（ENDED 是终态）取题接口没有任何守卫，会直接
@@ -129,7 +158,7 @@ public class QuestionController {
             );
         }
         // 新增结束
-        long deadline = System.currentTimeMillis() + 60_000L;
+        long deadline = System.currentTimeMillis() + readinessTimeoutSeconds * 1000L;
         while ((snapshot.state() == InterviewState.JUDGING
                         || snapshot.state() == InterviewState.ASKING
                         || snapshot.state() == InterviewState.MATCHING)
@@ -159,6 +188,18 @@ public class QuestionController {
         QuestionView pending = takeNextPendingQuestion(sessionId);
         if (pending != null) {
             return pending;   // 命中即返回，下面的同步生成不会执行
+        }
+
+        // 从这里开始是新增的：先给「预生成」一点时间，再去自己出题。
+        // 为什么这几秒能省下二十秒：预生成在「提交答案」那一刻就用独立线程池开跑了，
+        // 和评分并行；而取题必须先等评分闭环（JUDGING/ASKING 状态）才走得到这里。
+        // 也就是说预生成这时通常已经写完、只是比取题晚了几百毫秒。不查这一下，
+        // 就会白跑一次完整的出题调用——实测取第 2/3 题要 47~53 秒，其中约一半
+        // 时间花在这次重复生成上。等 8 秒是折中：命中就省一次模型调用，
+        // 等不到（预生成失败/未触发）仍走原有同步兜底，功能与之前一致，只是多等几秒。
+        pending = waitForPreGenerated(sessionId, 8);
+        if (pending != null) {
+            return pending;
         }
 
         // 第四步：全部已作答，查询当前会话中已有的最大题目序号。
@@ -395,8 +436,7 @@ public class QuestionController {
      */
     private QuestionView takeNextPendingQuestion(
             UUID sessionId
-    ) {
-        // 第一步：查"无答案记录"的最小序号题。
+    ) {        // 第一步：查"无答案记录"的最小序号题。
         // notExists 排除已作答的题（interview_answer 的初次与追问作答都算已作答）。
         List<QuestionEntity> pending = questions.selectList(
                 Wrappers.<QuestionEntity>lambdaQuery()
@@ -457,4 +497,38 @@ public class QuestionController {
         );
     }
     // 新增结束
+
+    // 从这里开始是新增的：在给定时间内轮询「是否有已就绪的待展示题」（含预生成题）。
+    /**
+     * 等一小会儿预生成的结果。
+     *
+     * <p>为什么要轮询而不是订阅：预生成是另一个线程池里的独立任务，没有回调、没有
+     * Future 交回来（设计上就是"尽力而为、失败不影响主流程"）。库里的 PRE_GENERATED
+     * 行本身就是它完成的信号，所以查库是最直接的判断方式，也不必改动预生成那边的契约。
+     *
+     * <p>为什么用 {@link #takeNextPendingQuestion} 而不是自己写查询：它已经处理了
+     * 「PRE_GENERATED 用 CAS 激活成 ACTIVE」和「排除已作答题」两件事，重复实现只会
+     * 让两条取题路径的语义慢慢分叉。
+     *
+     * @param sessionId  会话 ID
+     * @param maxSeconds 最多等多少秒
+     * @return 就绪的题；超时或线程被中断返回 null
+     */
+    private QuestionView waitForPreGenerated(UUID sessionId, int maxSeconds) {
+        long deadline = System.currentTimeMillis() + maxSeconds * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(800L);
+            } catch (InterruptedException interrupted) {
+                // 中断说明请求方已经不要结果了：恢复中断标记并放手，让调用方走同步兜底
+                Thread.currentThread().interrupt();
+                return null;
+            }
+            QuestionView ready = takeNextPendingQuestion(sessionId);
+            if (ready != null) {
+                return ready;
+            }
+        }
+        return null;
+    }
 }

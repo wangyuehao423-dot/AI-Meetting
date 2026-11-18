@@ -98,33 +98,36 @@ public class DemeanorAnalysisService {
                 ### 面试表现在线分析
 
                 > 该分析由 AI 基于整场作答文本自动生成，用于复盘语言表达，不评判技术答案正误。
+                > 分析只读文本、不读音频，因此给的是表达维度而非语速、语调这类需要声学特征的指标。
 
-                - 自信度：%.0f%%
-                - 表达清晰度：%.0f%%
+                - 自信度：%d%%
+                - 表达清晰度：%d%%
                 - 口头禅 / 填充词出现次数：%d 次
-                - 语速：%s
+                - 作答字数：%d 字
 
                 **AI 改进建议：**
 
                 > %s
                 """.formatted(
-                analysis.confidence() * 100,
-                analysis.clarityScore() * 100,
+                percent(analysis.confidence()),
+                percent(analysis.clarityScore()),
                 analysis.fillerCount(),
-                paceName(analysis.pace()),
+                analysis.transcriptLength(),
                 analysis.feedback()
         );
     }
 
-    /** 把语速枚举值翻译成中文展示，未知值统一回退为"适中"。 */
-    private String paceName(String pace) {
-        if (pace == null) {
-            return "未判断";
-        }
-        return switch (pace) {
-            case "slow" -> "偏慢";
-            case "fast" -> "偏快";
-            default -> "适中";
-        };
+    /**
+     * 把模型返回的评分归一化成 0~100 的整数百分比。
+     *
+     * <p>为什么必须归一化而不是直接乘 100：提示词里给的是 0.0~1.0 的小数示例，
+     * 但模型并不总是遵守——线上实测它会返回 65、72 这种已经是百分制的数。
+     * 直接乘 100 就会渲染成 6500%、7200%。这里按量级判断：
+     * 不大于 1 视为比例、大于 1 视为已是百分数，两种情况都收敛到 0~100，
+     * 无论模型守不守规矩，展示出来的都是一个正常百分比。
+     */
+    private int percent(double raw) {
+        double normalized = raw <= 1.0 ? raw * 100 : raw;
+        return (int) Math.round(Math.max(0, Math.min(100, normalized)));
     }
 }
